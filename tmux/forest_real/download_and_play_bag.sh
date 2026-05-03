@@ -7,8 +7,8 @@ rm -rf $OUT_FILE
 echo "[INFO] Checking internet connectivity..."
 
 # Try to reach the host (fast + reliable check)
-if ! ping -c 1 -W 2 "$HOST" >/dev/null 2>&1; then
-  echo "[ERROR] No internet connection or host unreachable: $HOST"
+if ! wget --spider --quiet --timeout=3 "$URL"; then
+  echo "[ERROR] Cannot reach the download server!"
   exit 1
 fi
 
