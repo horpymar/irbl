@@ -13,7 +13,7 @@ uav1:
   spawn:
     x: -20.0
     y: 0.0
-    z: 0.0
+    z: 1.7
     heading: 0.0
 
 mrs_uav_flightforge_simulator:

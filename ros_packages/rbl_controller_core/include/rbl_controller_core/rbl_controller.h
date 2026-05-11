@@ -58,6 +58,7 @@
 #include <optional>
 #include <mutex>
 #include <future>
+#include <cstdint>
 
 
 
@@ -142,20 +143,22 @@ private:
   RBLParams                                                 params_;
   bool                                                      flag_threshold;
   bool                                                      init_ = false;
+  bool                                                      has_goal_ = false;
+  bool                                                      pending_replan_ = false;
   bool                                                      threshold_active_ = false;
   double                                                    radius_sensing_;
   double                                                    altitude_;
   double                                                    beta_;
   double                                                    ph_; //vertical
   double                                                    th_; //azimuthal
-  Eigen::Vector3d                                           goal_; //final goal where the uav will converge
-  Eigen::Vector3d                                           destination_; //rotated current goal/waypoint
+  Eigen::Vector3d                                           goal_ = Eigen::Vector3d::Zero(); //final goal where the uav will converge
+  Eigen::Vector3d                                           destination_ = Eigen::Vector3d::Zero(); //rotated current goal/waypoint
   Eigen::Vector3d                                           waypoint_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d                                           seed_b_= Eigen::Vector3d::Zero();
-  Eigen::Vector3d                                           waypoint_fixed_distance_; //replanner waypoint
-  Eigen::Vector3d                                           agent_pos_; 
-  Eigen::Vector3d                                           agent_vel_; 
-  Eigen::Vector3d                                           rpy_; 
+  Eigen::Vector3d                                           waypoint_fixed_distance_ = Eigen::Vector3d::Zero(); //replanner waypoint
+  Eigen::Vector3d                                           agent_pos_ = Eigen::Vector3d::Zero(); 
+  Eigen::Vector3d                                           agent_vel_ = Eigen::Vector3d::Zero(); 
+  Eigen::Vector3d                                           rpy_ = Eigen::Vector3d::Zero(); 
   Eigen::Vector3d                                           c1_= Eigen::Vector3d::Zero();
   Eigen::Vector3d                                           c1_full_= Eigen::Vector3d::Zero();
   Eigen::Vector3d                                           c2_;
@@ -173,7 +176,8 @@ private:
   std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>>           cloud_obs_;
   std::shared_ptr<RBLReplanner>                             rbl_replanner_;
   std::shared_ptr<CIRI>                                     ciri_solver_;
-  std::future<std::vector<Eigen::Vector3d>>                 replanner_future_;
+  std::uint64_t                                             goal_generation_ = 0;
+  std::future<std::tuple<std::uint64_t, std::vector<Eigen::Vector3d>, std::vector<Eigen::Vector3d>>> replanner_future_;
   std::mutex                                                replanner_mutex_;
 
   std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>> getGroundCleanCloud(std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>>& cloud, const Eigen::Vector3d& agent_pos, const double& altitude);

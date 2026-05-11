@@ -58,10 +58,20 @@ void RBLController::setPCL(const std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>
    
 void RBLController::setGoal(const Eigen::Vector3d& point)  // //{
 {
-  goal_        = point;
-  destination_ = point;
-  ph_          = 0.0;
-  th_          = 0.0;
+  has_goal_                = true;
+  pending_replan_          = true;
+  ++goal_generation_;
+  goal_                    = point;
+  destination_             = point;
+  waypoint_                = point;
+  waypoint_fixed_distance_ = point;
+  c1_                      = point;
+  c1_full_                 = point;
+  seed_b_                  = agent_pos_;
+  path_.clear();
+  inflated_map_.clear();
+  ph_                      = 0.0;
+  th_                      = 0.0;
 }  // //}
 
 void RBLController::setBetaD(double beta)
@@ -166,6 +176,10 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
 {
   mrs_msgs::msg::Reference p_ref;
 
+  if (!has_goal_) {
+    return pRefAgent(agent_pos_, rpy_[2]);
+  }
+
   /* if (!inputsHealthy(agent_pos_, agent_vel_, group_states_, cloud_, goal_, altitude_, rpy_)) { */
   /*   std::cout << "[RBLController]: Inputs are not ok. Cannot return next reference" << std::endl; */
   /*   return std::nullopt; */
@@ -174,27 +188,33 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
   // cloud_ = getGroundCleanCloud(cloud_, agent_pos_, altitude_);
   // cloud_obs_ = getGroundCleanCloud(cloud_obs_, agent_pos_, altitude_);
   if (!cloud_) {
-    return std::nullopt;
+    return pRefAgent(agent_pos_, rpy_[2]);
   }
 
   if (params_.replanner) {
+    const bool replanner_idle =
+        !replanner_future_.valid() ||
+        replanner_future_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
 
     // Launch replanner only if not already running
-    if (rbl_replanner_->replanTimer() &&
-        (!replanner_future_.valid() ||
-         replanner_future_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)) {
+    if ((pending_replan_ || rbl_replanner_->replanTimer()) && replanner_idle) {
 
-      replanner_future_ = std::async(std::launch::async, [this]() {
-        rbl_replanner_->setAltitude(altitude_);
-        rbl_replanner_->setCurrentPosition(agent_pos_);
-        rbl_replanner_->setGoal(goal_);
-        rbl_replanner_->setPCL(cloud_);
+      const auto goal_snapshot       = goal_;
+      const auto altitude_snapshot   = altitude_;
+      const auto agent_pos_snapshot  = agent_pos_;
+      const auto cloud_snapshot      = cloud_;
+      const auto goal_generation     = goal_generation_;
+      pending_replan_                = false;
+
+      replanner_future_ = std::async(std::launch::async, [this, goal_snapshot, altitude_snapshot, agent_pos_snapshot, cloud_snapshot, goal_generation]() {
+        rbl_replanner_->setAltitude(altitude_snapshot);
+        rbl_replanner_->setCurrentPosition(agent_pos_snapshot);
+        rbl_replanner_->setGoal(goal_snapshot);
+        rbl_replanner_->setPCL(cloud_snapshot);
 
         auto new_path = rbl_replanner_->plan();
 
-        std::lock_guard<std::mutex> lock(replanner_mutex_);
-        inflated_map_ = rbl_replanner_->getInflatedCloud();
-        return new_path;
+        return std::make_tuple(goal_generation, new_path, rbl_replanner_->getInflatedCloud());
       });
     }
 
@@ -203,7 +223,11 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
         replanner_future_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
 
       std::lock_guard<std::mutex> lock(replanner_mutex_);
-      path_ = replanner_future_.get();   // latch new path
+      auto [planned_generation, new_path, new_inflated_map] = replanner_future_.get();
+      if (planned_generation == goal_generation_) {
+        path_ = std::move(new_path);
+        inflated_map_ = std::move(new_inflated_map);
+      }
     }
 
     // Use path if available, otherwise keep moving

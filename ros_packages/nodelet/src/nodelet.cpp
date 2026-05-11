@@ -425,11 +425,10 @@ void WrapperRosRBL::cbTmSetRef()  // //{
     return;
   }
 
-  if (!is_activated_) {
-    RCLCPP_INFO_ONCE(node_->get_logger(), "Waiting for activation");
+  if (!sh_odom_.hasMsg()) {
+    RCLCPP_WARN_THROTTLE(node_->get_logger(), *clock_, 2000, "Waiting for odometry");
     return;
   }
-  RCLCPP_INFO_ONCE(node_->get_logger(), "After activation");
 
   auto msg_ref = std::make_shared<mrs_msgs::srv::ReferenceStampedSrv::Request>();
   msg_ref->header.frame_id = _frame_;
@@ -437,60 +436,58 @@ void WrapperRosRBL::cbTmSetRef()  // //{
 
   {
     std::scoped_lock lck(mtx_rbl_);
-    if (sh_odom_.newMsg()) {
-      auto                        odom = sh_odom_.getMsg();
-      geometry_msgs::msg::PointStamped tmp_pt;
-      tmp_pt.header = odom->header;
-      tmp_pt.point  = odom->pose.pose.position;
-      auto res      = transformer_->transformSingle(tmp_pt, _frame_);
+    auto                        odom = sh_odom_.getMsg();
+    geometry_msgs::msg::PointStamped tmp_pt;
+    tmp_pt.header = odom->header;
+    tmp_pt.point  = odom->pose.pose.position;
+    auto res      = transformer_->transformSingle(tmp_pt, _frame_);
 
-      if (!res) {
-        RCLCPP_ERROR(node_->get_logger(), "Could not transform odometry msg to control frame.");
-        return;
-      }
-      rbl_controller_->setCurrentPosition(pointToEigen(res.value().point));
-      RCLCPP_INFO_ONCE(node_->get_logger(), "Setted cur position to rbl");
-
-      geometry_msgs::msg::Vector3Stamped tmp_vel;
-      tmp_vel.header = odom->header;
-      tmp_vel.vector = odom->twist.twist.linear;
-      auto vel_res   = transformer_->transformSingle(tmp_vel, _frame_);
-
-      if (!vel_res) {
-        RCLCPP_ERROR(node_->get_logger(), "Could not transform velocity to control frame.");
-        return;
-      }
-      rbl_controller_->setCurrentVelocity(vectorToEigen(vel_res->vector));
-      RCLCPP_INFO_ONCE(node_->get_logger(), "Setted velocity to rbl");
-      Eigen::Vector3d euler;
-
-      double q_x = odom->pose.pose.orientation.x;
-      double q_y = odom->pose.pose.orientation.y;
-      double q_z = odom->pose.pose.orientation.z;
-      double q_w = odom->pose.pose.orientation.w;
-
-      // Roll (X-axis rotation)
-      double sinr_cosp = 2.0 * (q_w * q_x + q_y * q_z);
-      double cosr_cosp = 1.0 - 2.0 * (q_x * q_x + q_y * q_y);
-      euler.x()        = std::atan2(sinr_cosp, cosr_cosp);
-
-      // Pitch (Y-axis rotation)
-      double sinp = 2.0 * (q_w * q_y - q_z * q_x);
-      if (std::abs(sinp) >= 1) {
-        euler.y() = std::copysign(M_PI / 2, sinp);  // Use 90 degrees if out of range
-      }
-      else {
-        euler.y() = std::asin(sinp);
-      }
-
-      // Yaw (Z-axis rotation)
-      double siny_cosp = 2.0 * (q_w * q_z + q_x * q_y);
-      double cosy_cosp = 1.0 - 2.0 * (q_y * q_y + q_z * q_z);
-      euler.z()        = std::atan2(siny_cosp, cosy_cosp);
-
-      rbl_controller_->setRollPitchYaw(euler);
-      RCLCPP_INFO_ONCE(node_->get_logger(), "Setted rpy to rbl");
+    if (!res) {
+      RCLCPP_ERROR(node_->get_logger(), "Could not transform odometry msg to control frame.");
+      return;
     }
+    rbl_controller_->setCurrentPosition(pointToEigen(res.value().point));
+    RCLCPP_INFO_ONCE(node_->get_logger(), "Setted cur position to rbl");
+
+    geometry_msgs::msg::Vector3Stamped tmp_vel;
+    tmp_vel.header = odom->header;
+    tmp_vel.vector = odom->twist.twist.linear;
+    auto vel_res   = transformer_->transformSingle(tmp_vel, _frame_);
+
+    if (!vel_res) {
+      RCLCPP_ERROR(node_->get_logger(), "Could not transform velocity to control frame.");
+      return;
+    }
+    rbl_controller_->setCurrentVelocity(vectorToEigen(vel_res->vector));
+    RCLCPP_INFO_ONCE(node_->get_logger(), "Setted velocity to rbl");
+    Eigen::Vector3d euler;
+
+    double q_x = odom->pose.pose.orientation.x;
+    double q_y = odom->pose.pose.orientation.y;
+    double q_z = odom->pose.pose.orientation.z;
+    double q_w = odom->pose.pose.orientation.w;
+
+    // Roll (X-axis rotation)
+    double sinr_cosp = 2.0 * (q_w * q_x + q_y * q_z);
+    double cosr_cosp = 1.0 - 2.0 * (q_x * q_x + q_y * q_y);
+    euler.x()        = std::atan2(sinr_cosp, cosr_cosp);
+
+    // Pitch (Y-axis rotation)
+    double sinp = 2.0 * (q_w * q_y - q_z * q_x);
+    if (std::abs(sinp) >= 1) {
+      euler.y() = std::copysign(M_PI / 2, sinp);  // Use 90 degrees if out of range
+    }
+    else {
+      euler.y() = std::asin(sinp);
+    }
+
+    // Yaw (Z-axis rotation)
+    double siny_cosp = 2.0 * (q_w * q_z + q_x * q_y);
+    double cosy_cosp = 1.0 - 2.0 * (q_y * q_y + q_z * q_z);
+    euler.z()        = std::atan2(siny_cosp, cosy_cosp);
+
+    rbl_controller_->setRollPitchYaw(euler);
+    RCLCPP_INFO_ONCE(node_->get_logger(), "Setted rpy to rbl");
 
     if (sh_alt_.newMsg()) {
       auto alt = sh_alt_.getMsg();
@@ -603,18 +600,24 @@ void WrapperRosRBL::cbTmSetRef()  // //{
     }
 
   } else {
-    // if (sh_pcl_.newMsg()) {
+    if (sh_pcl_.hasMsg()) {
       auto msg = sh_pcl_.getMsg();
-      pcl::PointCloud<pcl::PointXYZI> tmp;
-      pcl::fromROSMsg(*msg, tmp);
-      last_obstacle_cloud_ = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>(tmp);
-      
-      std::cout << last_obstacle_cloud_->points.size() << std::endl;
-      pcl_loaded_ = true;
-      rbl_controller_->setPCL(last_obstacle_cloud_);
-      // rbl_controller_->setPCL1(last_obstacle_cloud_);
-      RCLCPP_INFO_ONCE(node_->get_logger(), "Setted last pcl to rbl");
-    // }
+      if (!msg) {
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *clock_, 2000, "Waiting for point cloud message");
+      } else {
+        pcl::PointCloud<pcl::PointXYZI> tmp;
+        pcl::fromROSMsg(*msg, tmp);
+        last_obstacle_cloud_ = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>(tmp);
+
+        std::cout << last_obstacle_cloud_->points.size() << std::endl;
+        pcl_loaded_ = true;
+        rbl_controller_->setPCL(last_obstacle_cloud_);
+        // rbl_controller_->setPCL1(last_obstacle_cloud_);
+        RCLCPP_INFO_ONCE(node_->get_logger(), "Setted last pcl to rbl");
+      }
+    } else {
+      RCLCPP_WARN_THROTTLE(node_->get_logger(), *clock_, 2000, "Waiting for point cloud message");
+    }
   }
 
   if (!last_obstacle_cloud_) {
@@ -639,6 +642,12 @@ void WrapperRosRBL::cbTmSetRef()  // //{
   rbl_controller_->setPCL(cloud);
   RCLCPP_INFO_ONCE(node_->get_logger(), "Setted curent pcl to rbl");
   pub_viz_cloud.publish(*getVizPCL(cloud, _frame_));
+
+  if (!is_activated_) {
+    RCLCPP_INFO_ONCE(node_->get_logger(), "Waiting for activation");
+    return;
+  }
+  RCLCPP_INFO_ONCE(node_->get_logger(), "After activation");
 
     // if (_group_odoms_enabled_ && _add_agents_to_pcl_) {
     //   cloud = addAgents2PCL(cloud, group_states, rbl_params_.voxel_size, rbl_params_.encumbrance);
@@ -669,6 +678,10 @@ void WrapperRosRBL::cbTmDiagnostics()  // //{
 {
 
   if (!is_initialized_) {
+    return;
+  }
+
+  if (!sh_odom_.hasMsg()) {
     return;
   }
 
