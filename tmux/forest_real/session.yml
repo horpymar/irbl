@@ -59,7 +59,7 @@ windows:
       layout: tiled
       synchronize: after
       panes:
-        - 'history -s ros2 service call /uav1/rbl_controller/goto mrs_msgs/srv/Vec4 "{goal: [2.0, 60.0, 2.0, 0.0]}"'
+        - 'history -s ros2 service call /uav1/rbl_controller/goto mrs_msgs/srv/Vec4 \"{goal: [20.0, 0.0, 2.0, 0.0]}\"'
   - filter_reflective_uavs:
       layout: tiled
       synchronize: after

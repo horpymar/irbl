@@ -1,5 +1,33 @@
 #include "rbl_controller_core/rbl_controller.h"
 
+#include <iomanip>
+#include <map>
+#include <sstream>
+
+namespace {
+
+bool shouldLogRbl(const std::string& key, const double period_s = 1.0)
+{
+  static std::map<std::string, std::chrono::steady_clock::time_point> last_print;
+  const auto now = std::chrono::steady_clock::now();
+  const auto it  = last_print.find(key);
+  if (it == last_print.end() || std::chrono::duration<double>(now - it->second).count() >= period_s) {
+    last_print[key] = now;
+    return true;
+  }
+  return false;
+}
+
+std::string vecToString(const Eigen::Vector3d& vec)
+{
+  std::ostringstream ss;
+  ss << std::fixed << std::setprecision(3)
+     << "[" << vec.x() << ", " << vec.y() << ", " << vec.z() << "]";
+  return ss.str();
+}
+
+}  // namespace
+
 RBLController::RBLController(const RBLParams& params) : params_(params)  // //{
 {
   radius_sensing_ = params_.radius / params_.cwvd_obs + sqrt((params_.voxel_size / 2) * (params_.voxel_size / 2));
@@ -48,6 +76,17 @@ void RBLController::setGroupStates(const std::vector<State>& states)  // //{
 void RBLController::setPCL(const std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>>& cloud)  // //{
 {
   cloud_ = cloud;
+  if (shouldLogRbl("set_pcl", 2.0)) {
+    if (!cloud_) {
+      std::cout << "[RBLController][input] setPCL received null cloud" << std::endl;
+    }
+    else {
+      std::cout << "[RBLController][input] setPCL size=" << cloud_->size()
+                << ", width=" << cloud_->width
+                << ", height=" << cloud_->height
+                << ", is_dense=" << cloud_->is_dense << std::endl;
+    }
+  }
 }  // //}
    //
 
@@ -296,6 +335,19 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
                           seed_b_,
                           threshold_active_);
 
+  if (shouldLogRbl("cells_after_partition", 1.0)) {
+    std::cout << "[RBLController][cells] cell_S=" << cell_S_.size()
+              << ", cell_A=" << cell_A_.size()
+              << ", sensed_A=" << sensed_cell_A_.size()
+              << ", planes=" << plane_normals_.size()
+              << ", group_states=" << group_states_.size()
+              << ", beta=" << beta_
+              << ", agent=" << vecToString(agent_pos_)
+              << ", goal=" << vecToString(goal_)
+              << ", destination=" << vecToString(destination_)
+              << ", waypoint=" << vecToString(waypoint_) << std::endl;
+  }
+
 
   std::vector<Eigen::Vector3d> emptyVec;
   if (params_.replanner) {
@@ -414,6 +466,19 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
   // }
   // if c1_ is very close to uav.
   determineNextRef(p_ref, agent_pos_, waypoint_, goal_, c1_, c1_full_, rpy_, path_);
+
+  if (shouldLogRbl("reference_out", 0.5)) {
+    const Eigen::Vector3d ref(p_ref.position.x, p_ref.position.y, p_ref.position.z);
+    std::cout << "[RBLController][ref] ref=" << vecToString(ref)
+              << ", ref_dist=" << (ref - agent_pos_).norm()
+              << ", c1=" << vecToString(c1_)
+              << ", c1_full=" << vecToString(c1_full_)
+              << ", c1_dist=" << (c1_ - agent_pos_).norm()
+              << ", c1_full_dist=" << (c1_full_ - agent_pos_).norm()
+              << ", heading=" << p_ref.heading
+              << ", limited_fov=" << params_.limited_fov
+              << ", threshold_active=" << threshold_active_ << std::endl;
+  }
 
   return p_ref;
 }  // //}
@@ -733,6 +798,15 @@ bool RBLController::partitionCellACiri(std::vector<Eigen::Vector3d>&            
   // (void)neighbors;     // TODO - currently unused
   (void)threshold_active;     // TODO - currently unused
 
+  if (shouldLogRbl("ciri_entry", 1.0)) {
+    std::cout << "[RBLController][ciri] input cell_S=" << cell_S.size()
+              << ", cloud=" << (cloud ? cloud->size() : 0)
+              << ", neighbors=" << neighbors.size()
+              << ", agent=" << vecToString(agent_pos)
+              << ", c1_in=" << vecToString(c1)
+              << ", seed_in=" << vecToString(seed_b) << std::endl;
+  }
+
   if (!ciri_solver_) {
     std::cout << "[RBLController]: Ciri solver is not initialized." << std::endl;
     return false;
@@ -825,9 +899,19 @@ bool RBLController::partitionCellACiri(std::vector<Eigen::Vector3d>&            
 
   if (result) {
     // std::cout << "[RBLController]: Convex decomposition was successful." << std::endl;
+    if (shouldLogRbl("ciri_success", 1.0)) {
+      std::cout << "[RBLController][ciri] success, planes=" << plane_data.size()
+                << ", seed=" << vecToString(seed_b)
+                << ", dist_agent_seed=" << (seed_b - agent_pos).norm() << std::endl;
+    }
   }
   else {
     // std::cout << "[RBLController]: Convex decomposition failed. " << std::endl;
+    if (shouldLogRbl("ciri_failed", 1.0)) {
+      std::cout << "[RBLController][ciri] failed, dist_agent_seed=" << dist_agent_seed
+                << ", cloud=" << num_points
+                << ", boundary_radius=" << params_.radius + 1.0 << std::endl;
+    }
     return false;
   }
 
@@ -894,6 +978,11 @@ bool RBLController::partitionCellACiri(std::vector<Eigen::Vector3d>&            
     if (!remove_mask[i]) {
       cell_A.push_back(cell_S[i]);
     }
+  }
+  if (shouldLogRbl("ciri_output", 1.0)) {
+    std::cout << "[RBLController][ciri] output cell_A=" << cell_A.size()
+              << ", from cell_S=" << cell_S.size()
+              << ", planes=" << plane_normals.size() << std::endl;
   }
   return true;
 }  // //}
@@ -978,6 +1067,14 @@ cloud_high_intensity->is_dense = true;
 cloud_low_intensity->width = static_cast<std::uint32_t>(cloud_low_intensity->points.size());
 cloud_low_intensity->height = 1;
 cloud_low_intensity->is_dense = true;
+
+if (shouldLogRbl("cloud_split", 1.0)) {
+  std::cout << "[RBLController][cloud] total=" << (cloud ? cloud->size() : 0)
+            << ", high_intensity=" << cloud_high_intensity->size()
+            << ", low_intensity=" << cloud_low_intensity->size()
+            << ", intensity_threshold=" << INTENSITY_THRESH
+            << ", ciri=" << params_.ciri << std::endl;
+}
 // std::cout << "cloud_high_intensity: " << cloud_high_intensity->points.size() << std::endl;
 // std::cout << "cloud_low_intensity: " << cloud_low_intensity->points.size() << std::endl;
 
@@ -1012,6 +1109,13 @@ cloud_low_intensity->is_dense = true;
   else {  // 3D case
     pointsInsideSphere(cell_S, agent_pos, params_.radius, params_.step_size, altitude);
   }
+  if (shouldLogRbl("cell_s_created", 1.0)) {
+    std::cout << "[RBLController][cells] generated cell_S=" << cell_S.size()
+              << ", radius=" << params_.radius
+              << ", step_size=" << params_.step_size
+              << ", altitude=" << altitude
+              << ", only_2d=" << params_.only_2d << std::endl;
+  }
   if (group_states_.empty()) {
       std::cout << "[RBLController]: group states empty." << std::endl;
   }
@@ -1019,6 +1123,10 @@ cloud_low_intensity->is_dense = true;
     if (params_.ciri) {
       // std::cout << "[RBLController]: cell_b "<< cell_B.size() << std::endl;
       partitionCellA(cell_B, cell_S, plane_normals, plane_points, agent_pos, neighbors_pos, cloud_high_intensity);
+      if (shouldLogRbl("cell_b_after_partition", 1.0)) {
+        std::cout << "[RBLController][cells] cell_B=" << cell_B.size()
+                  << " after high-intensity partition, planes=" << plane_normals.size() << std::endl;
+      }
       /* partitionCellA(cell_B, cell_S, plane_normals, plane_points, agent_pos, group_positions, cloud_high_intensity); */
       // std::cout << "[RBLController]: cell_b1 "<< cell_B.size() << std::endl;
       bool success = false;
@@ -1043,20 +1151,36 @@ cloud_low_intensity->is_dense = true;
       } 
 
       if (!success || cell_A.size() == 0) {
-        std::cout << "[RBLController]: Ciri failed. Using classic partition." << std::endl;
+        std::cout << "[RBLController]: Ciri failed or empty cell_A. Using classic partition. success=" << success
+                  << ", cell_A=" << cell_A.size() << std::endl;
         cell_A.clear();
         partitionCellA(cell_A, cell_S, plane_normals, plane_points, agent_pos, neighbors_pos, cloud);
         seed_b = agent_pos;
+        if (shouldLogRbl("classic_after_ciri_fallback", 1.0)) {
+          std::cout << "[RBLController][cells] classic fallback cell_A=" << cell_A.size()
+                    << ", planes=" << plane_normals.size() << std::endl;
+        }
       }
     }
     else {
       partitionCellA(cell_A, cell_S, plane_normals, plane_points, agent_pos, neighbors_pos, cloud);
+      if (shouldLogRbl("classic_partition", 1.0)) {
+        std::cout << "[RBLController][cells] classic partition cell_A=" << cell_A.size()
+                  << ", planes=" << plane_normals.size() << std::endl;
+      }
     }
   // }
   // else {
   //   cell_A = cell_S;
   // }
   sensed_cell_A = computeActivelySensedCell(cell_A, agent_pos, rpy);
+  if (shouldLogRbl("sensed_cell", 1.0)) {
+    std::cout << "[RBLController][cells] sensed_cell_A=" << sensed_cell_A.size()
+              << " from cell_A=" << cell_A.size()
+              << ", lidar_tilt=" << params_.lidar_tilt
+              << ", lidar_fov=" << params_.lidar_fov
+              << ", rpy=" << vecToString(rpy) << std::endl;
+  }
 }  // //}
 
 std::vector<Eigen::Vector3d> RBLController::computeActivelySensedCell(std::vector<Eigen::Vector3d>& cell_A,
@@ -1165,20 +1289,55 @@ void RBLController::computeCentroid(Eigen::Vector3d&              centroid,  // 
   double sum_y = 0.0;
   double sum_z = 0.0;
   double sum   = 0.0;
+  double min_weight = std::numeric_limits<double>::max();
+  double max_weight = 0.0;
+  std::size_t finite_weights = 0;
+  std::size_t positive_weights = 0;
 
   for (size_t i = 0; i < x_in.size(); ++i) {
     sum_x += x_in[i] * scalar_values[i];
     sum_y += y_in[i] * scalar_values[i];
     sum_z += z_in[i] * scalar_values[i];
     sum += scalar_values[i];
+    if (std::isfinite(scalar_values[i])) {
+      ++finite_weights;
+      min_weight = std::min(min_weight, scalar_values[i]);
+      max_weight = std::max(max_weight, scalar_values[i]);
+      if (scalar_values[i] > 0.0) {
+        ++positive_weights;
+      }
+    }
   }
   if (sum <= std::numeric_limits<double>::epsilon() || !std::isfinite(sum)) {
     centroid = agent_pos;
     threshold_active = false;
-    std::cout << "[RBLController]: ComputeCentroid received invalid weights, using agent position." << std::endl;
+    std::cout << "[RBLController]: ComputeCentroid received invalid weights, using agent position. "
+              << "cell=" << cell.size()
+              << ", beta=" << beta
+              << ", sum=" << sum
+              << ", finite_weights=" << finite_weights
+              << ", positive_weights=" << positive_weights
+              << ", min_weight=" << (finite_weights > 0 ? min_weight : 0.0)
+              << ", max_weight=" << max_weight
+              << ", destination=" << vecToString(destination)
+              << ", goal=" << vecToString(goal)
+              << ", agent=" << vecToString(agent_pos)
+              << ", dist_agent_destination=" << (destination - agent_pos).norm() << std::endl;
     return;
   }
   centroid = Eigen::Vector3d(sum_x / sum, sum_y / sum, sum_z / sum);
+
+  if (shouldLogRbl("centroid_weights", 1.0)) {
+    std::cout << "[RBLController][centroid] cell=" << cell.size()
+              << ", beta=" << beta
+              << ", sum=" << sum
+              << ", min_weight=" << min_weight
+              << ", max_weight=" << max_weight
+              << ", centroid=" << vecToString(centroid)
+              << ", centroid_dist=" << (centroid - agent_pos).norm()
+              << ", destination=" << vecToString(destination)
+              << ", dist_agent_destination=" << (destination - agent_pos).norm() << std::endl;
+  }
 
   double min_distance        = std::numeric_limits<double>::max();
   int closest_plane_index = -1;
@@ -1208,6 +1367,13 @@ void RBLController::computeCentroid(Eigen::Vector3d&              centroid,  // 
   if (min_distance < params_.boundary_threshold && beta < 20.0 && agent_vel_.norm() > params_.boundary_threshold_speed) {
     beta = beta + 0.1;
     threshold_active = true;
+
+    if (shouldLogRbl("centroid_boundary_recursion", 1.0)) {
+      std::cout << "[RBLController][centroid] near boundary, retrying with beta=" << beta
+                << ", min_distance=" << min_distance
+                << ", boundary_threshold=" << params_.boundary_threshold
+                << ", agent_vel_norm=" << agent_vel_.norm() << std::endl;
+    }
 
     // std::cout << "[RBLController]: computing centroid again. new beta: " << beta << ", distance to boundary: " <<
     // min_distance << std::endl;
@@ -1247,15 +1413,67 @@ void RBLController::computeScalarValue(std::vector<double>&       scalar_values,
 {
   (void)goal;     // TODO - currently unused
 
+  scalar_values.clear();
+  scalar_values.reserve(x_test.size());
+
+  std::vector<double> distances;
+  distances.reserve(x_test.size());
+
+  double min_distance = std::numeric_limits<double>::max();
+  double max_distance = 0.0;
+  std::size_t finite_distances = 0;
+
   for (size_t i = 0; i < x_test.size(); ++i) {
-    double distance = std::sqrt(std::pow((x_test[i] - destination[0]), 2) + std::pow((y_test[i] - destination[1]), 2) +
-                                std::pow((z_test[i] - destination[2]), 2));
+    const double distance = std::sqrt(std::pow((x_test[i] - destination[0]), 2) + std::pow((y_test[i] - destination[1]), 2) +
+                                      std::pow((z_test[i] - destination[2]), 2));
 
     // double distance_to_goal= std::sqrt(std::pow((x_test[i] - goal[0]), 2) + std::pow((y_test[i] - goal[1]), 2) +
     //                             std::pow((z_test[i] - goal[2]), 2));
 
-    double scalar_value = std::exp(-distance / beta);
+    distances.push_back(distance);
+
+    if (std::isfinite(distance)) {
+      ++finite_distances;
+      min_distance = std::min(min_distance, distance);
+      max_distance = std::max(max_distance, distance);
+    }
+  }
+
+  if (finite_distances == 0 || beta <= std::numeric_limits<double>::epsilon() || !std::isfinite(beta)) {
+    scalar_values.assign(x_test.size(), 0.0);
+    if (shouldLogRbl("scalar_value_invalid_inputs", 1.0)) {
+      std::cout << "[RBLController][weights] invalid input for weights, n=" << x_test.size()
+                << ", finite_distances=" << finite_distances
+                << ", beta=" << beta
+                << ", destination=" << vecToString(destination) << std::endl;
+    }
+    return;
+  }
+
+  double min_exponent = std::numeric_limits<double>::max();
+  double max_exponent = -std::numeric_limits<double>::max();
+
+  for (const double distance : distances) {
+    const double exponent = -(distance - min_distance) / beta;
+    const double scalar_value = std::isfinite(exponent) ? std::exp(exponent) : 0.0;
     scalar_values.push_back(scalar_value);
+
+    if (std::isfinite(exponent)) {
+      min_exponent = std::min(min_exponent, exponent);
+      max_exponent = std::max(max_exponent, exponent);
+    }
+  }
+
+  if (shouldLogRbl("scalar_value_stats", 1.0)) {
+    std::cout << "[RBLController][weights] n=" << x_test.size()
+              << ", beta=" << beta
+              << ", finite_distances=" << finite_distances
+              << ", min_distance=" << (finite_distances > 0 ? min_distance : 0.0)
+              << ", max_distance=" << max_distance
+              << ", min_exponent=" << min_exponent
+              << ", max_exponent=" << max_exponent
+              << ", normalized=true"
+              << ", destination=" << vecToString(destination) << std::endl;
   }
 }  // //}
 
