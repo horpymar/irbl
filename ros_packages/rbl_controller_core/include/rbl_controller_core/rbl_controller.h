@@ -135,6 +135,8 @@ bool inputsHealthy( const Eigen::Vector3d&                                      
   Eigen::Vector3d                               getSeedB();
   std::vector<Eigen::Vector3d>                  getCellA();
   std::vector<Eigen::Vector3d>                  getSensedCellA();
+  std::vector<Eigen::Vector3d>                  getCellS();
+  std::vector<Eigen::Vector3d>                  getLocalObstaclePoints();
   std::vector<Eigen::Vector3d>                  getInflatedMap();
   std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>> getPCL();
   std::vector<Eigen::Vector3d>                  getPath();
@@ -167,6 +169,7 @@ private:
   std::vector<Eigen::Vector3d>                              cell_A_;
   std::vector<Eigen::Vector3d>                              sensed_cell_A_;
   std::vector<Eigen::Vector3d>                              cell_S_;
+  std::vector<Eigen::Vector3d>                              local_obstacle_points_;
   std::vector<Eigen::Vector3d>                              plane_normals_;
   std::vector<Eigen::Vector3d>                              plane_points_;
   std::vector<Eigen::Vector3d>                              inflated_map_;

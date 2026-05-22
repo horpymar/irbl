@@ -39,6 +39,8 @@
 
 #include <std_srvs/srv/trigger.hpp>
 
+#include <optional>
+
 // OCTOMAP
 #include <octomap/OcTree.h>
 
@@ -53,6 +55,7 @@
 #include <pcl_conversions/pcl_conversions.h>
 
 // Standard CPP libs
+#include <chrono>
 #include <cmath>
 #include <string>
 
@@ -84,6 +87,7 @@ private:
   std::vector<State> group_states_;
   std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>> last_obstacle_cloud_;
   bool pcl_loaded_ = false;
+  std::chrono::steady_clock::time_point last_cloud_viz_publish_ = std::chrono::steady_clock::time_point::min();
 
   bool         is_initialized_ = false;
   bool         is_activated_   = false;
@@ -95,6 +99,7 @@ private:
   std::string _frame_;
 
   std::mutex                     mtx_rbl_;
+  std::mutex                     mtx_set_ref_;
   std::shared_ptr<RBLController> rbl_controller_;
   RBLParams                      rbl_params_;
 
@@ -135,8 +140,10 @@ private:
   mrs_lib::PublisherHandler<visualization_msgs::msg::Marker> pub_viz_seed_B_;
   mrs_lib::PublisherHandler<visualization_msgs::msg::Marker> pub_viz_target_;
   mrs_lib::PublisherHandler<visualization_msgs::msg::Marker> pub_viz_waypoint_;
+  mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2> pub_viz_cell_S_;
   mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2> pub_viz_cell_A_;
   mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2> pub_viz_cell_A_sensed_;
+  mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2> pub_viz_local_obstacles_;
   mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2> pub_viz_inflated_map_;
   mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2> pub_viz_cloud;
   mrs_lib::PublisherHandler<nav_msgs::msg::Path> pub_viz_path_;
@@ -341,8 +348,10 @@ void WrapperRosRBL::initialize()  // //{
   pub_viz_seed_B_        = mrs_lib::PublisherHandler<visualization_msgs::msg::Marker>(node_, "~/seed_B");
   pub_viz_target_        = mrs_lib::PublisherHandler<visualization_msgs::msg::Marker>(node_, "~/target");
   pub_viz_waypoint_      = mrs_lib::PublisherHandler<visualization_msgs::msg::Marker>(node_, "~/replanner_waypoint");
+  pub_viz_cell_S_        = mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2>(node_, "~/cell_s");
   pub_viz_cell_A_        = mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2>(node_, "~/cell_a");
   pub_viz_cell_A_sensed_ = mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2>(node_, "~/actively_sensed_A");
+  pub_viz_local_obstacles_ = mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2>(node_, "~/local_obstacles");
   pub_viz_inflated_map_  = mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2>(node_, "~/inflated_map");
   pub_viz_cloud          = mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2>(node_, "~/cloud");
   pub_viz_path_          = mrs_lib::PublisherHandler<nav_msgs::msg::Path>(node_, "~/path");
@@ -421,6 +430,8 @@ void WrapperRosRBL::updateGroupStates(const filter_reflective_uavs::msg::PoseVel
 
 void WrapperRosRBL::cbTmSetRef()  // //{
 {
+  std::scoped_lock set_ref_lck(mtx_set_ref_);
+
   if (!is_initialized_) {
     return;
   }
@@ -594,7 +605,10 @@ void WrapperRosRBL::cbTmSetRef()  // //{
 
       last_obstacle_cloud_ = cloud;
       pcl_loaded_ = true;
-      rbl_controller_->setPCL(last_obstacle_cloud_);
+      {
+        std::scoped_lock lck(mtx_rbl_);
+        rbl_controller_->setPCL(last_obstacle_cloud_);
+      }
       // rbl_controller_->setPCL1(last_obstacle_cloud_);
       RCLCPP_INFO_ONCE(node_->get_logger(), "Setted last pcl to rbl");
     }
@@ -611,7 +625,10 @@ void WrapperRosRBL::cbTmSetRef()  // //{
 
         std::cout << last_obstacle_cloud_->points.size() << std::endl;
         pcl_loaded_ = true;
-        rbl_controller_->setPCL(last_obstacle_cloud_);
+        {
+          std::scoped_lock lck(mtx_rbl_);
+          rbl_controller_->setPCL(last_obstacle_cloud_);
+        }
         // rbl_controller_->setPCL1(last_obstacle_cloud_);
         RCLCPP_INFO_ONCE(node_->get_logger(), "Setted last pcl to rbl");
       }
@@ -628,8 +645,13 @@ void WrapperRosRBL::cbTmSetRef()  // //{
   auto cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>(*last_obstacle_cloud_);
 
   if (_group_odoms_enabled_ && _add_agents_to_pcl_) {
+    std::vector<State> group_states_snapshot;
+    {
+      std::scoped_lock lck(mtx_rbl_);
+      group_states_snapshot = group_states_;
+    }
     cloud = addAgents2PCL(cloud,
-                          group_states_,
+                          group_states_snapshot,
                           rbl_params_.voxel_size,
                           rbl_params_.encumbrance);
   }
@@ -639,9 +661,16 @@ void WrapperRosRBL::cbTmSetRef()  // //{
     return;
   }
 
-  rbl_controller_->setPCL(cloud);
+  {
+    std::scoped_lock lck(mtx_rbl_);
+    rbl_controller_->setPCL(cloud);
+  }
   RCLCPP_INFO_ONCE(node_->get_logger(), "Setted curent pcl to rbl");
-  pub_viz_cloud.publish(*getVizPCL(cloud, _frame_));
+  const auto now = std::chrono::steady_clock::now();
+  if (std::chrono::duration<double>(now - last_cloud_viz_publish_).count() >= 0.5) {
+    pub_viz_cloud.publish(*getVizPCL(cloud, _frame_));
+    last_cloud_viz_publish_ = now;
+  }
 
   if (!is_activated_) {
     RCLCPP_INFO_ONCE(node_->get_logger(), "Waiting for activation");
@@ -659,7 +688,11 @@ void WrapperRosRBL::cbTmSetRef()  // //{
     // rbl_controller_->setPCL(cloud);
     // pub_viz_cloud.publish(*getVizPCL(cloud, _frame_));
 
-  auto ret = rbl_controller_->getNextRef();
+  std::optional<mrs_msgs::msg::Reference> ret;
+  {
+    std::scoped_lock lck(mtx_rbl_);
+    ret = rbl_controller_->getNextRef();
+  }
   if (!ret) {
     RCLCPP_ERROR(node_->get_logger(), "Could not get next valid ref");
     return;
@@ -690,9 +723,12 @@ void WrapperRosRBL::cbTmDiagnostics()  // //{
   Eigen::Vector3d current_position;
   Eigen::Vector3d centroid;
   Eigen::Vector3d seed_b;
-  std::vector<Eigen::Vector3d> cell_a_points;
+  // Heavy debug point clouds are intentionally not copied/published while profiling timing.
+  // std::vector<Eigen::Vector3d> cell_a_points;
   std::vector<Eigen::Vector3d> sensed_cell_a_points;
-  std::vector<Eigen::Vector3d> inflated_map_points;
+  // std::vector<Eigen::Vector3d> cell_s_points;
+  std::vector<Eigen::Vector3d> local_obstacle_points;
+  // std::vector<Eigen::Vector3d> inflated_map_points;
   std::vector<Eigen::Vector3d> path_points;
 
   {
@@ -702,9 +738,11 @@ void WrapperRosRBL::cbTmDiagnostics()  // //{
     current_position     = rbl_controller_->getCurrentPosition();
     centroid             = rbl_controller_->getCentroid();
     seed_b               = rbl_controller_->getSeedB();
-    cell_a_points        = rbl_controller_->getCellA();
+    // cell_a_points        = rbl_controller_->getCellA();
     sensed_cell_a_points = rbl_controller_->getSensedCellA();
-    inflated_map_points  = rbl_controller_->getInflatedMap();
+    // cell_s_points        = rbl_controller_->getCellS();
+    local_obstacle_points = rbl_controller_->getLocalObstaclePoints();
+    // inflated_map_points  = rbl_controller_->getInflatedMap();
     path_points          = rbl_controller_->getPath();
   }
 
@@ -714,26 +752,30 @@ void WrapperRosRBL::cbTmDiagnostics()  // //{
   pub_viz_centroid_.publish(getVizCentroid(centroid, _frame_));
   pub_viz_seed_B_.publish(getVizCentroid(seed_b, _frame_));
 
-  auto cell_A = getVizCellA(cell_a_points, _frame_);
-  if (cell_A) {
-    pub_viz_cell_A_.publish(*cell_A);
-  } else {
-    RCLCPP_WARN(node_->get_logger(), "Failed to publish cell A");
-  }
+  // auto cell_S = getVizCellA(cell_s_points, _frame_);
+  // if (cell_S) {
+  //   pub_viz_cell_S_.publish(*cell_S);
+  // }
+
+  // auto cell_A = getVizCellA(cell_a_points, _frame_);
+  // if (cell_A) {
+  //   pub_viz_cell_A_.publish(*cell_A);
+  // }
 
   auto cell_A_sensed = getVizCellA(sensed_cell_a_points, _frame_);
   if (cell_A_sensed) {
     pub_viz_cell_A_sensed_.publish(*cell_A_sensed);
-  } else {
-    RCLCPP_WARN(node_->get_logger(), "Failed to publish sensed cell A");
   }
 
-  auto inflated_map = getVizInflatedMap(inflated_map_points, _frame_);
-  if (inflated_map) {
-    pub_viz_inflated_map_.publish(*inflated_map);
-  } else {
-    RCLCPP_WARN(node_->get_logger(), "Failed to publish inflated map");
+  auto local_obstacles = getVizCellA(local_obstacle_points, _frame_);
+  if (local_obstacles) {
+    pub_viz_local_obstacles_.publish(*local_obstacles);
   }
+
+  // auto inflated_map = getVizInflatedMap(inflated_map_points, _frame_);
+  // if (inflated_map) {
+  //   pub_viz_inflated_map_.publish(*inflated_map);
+  // }
 
   auto path = getVizPath(path_points, _frame_);
   if (path) {

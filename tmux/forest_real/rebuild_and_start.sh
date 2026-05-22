@@ -14,7 +14,7 @@ fi
 
 cd "$WORKSPACE_SRC"
 
-colcon build --symlink-install --packages-select rbl_controller_core rbl_replanner rbl_controller_node
+colcon build --symlink-install --packages-select ciri rbl_controller_core rbl_replanner rbl_controller_node
 
 if [ -f install/setup.bash ]; then
   source install/setup.bash

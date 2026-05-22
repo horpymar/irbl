@@ -26,11 +26,96 @@ std::string vecToString(const Eigen::Vector3d& vec)
   return ss.str();
 }
 
+bool isFinitePoint(const pcl::PointXYZI& point)
+{
+  return std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z);
+}
+
+bool isFiniteVector(const Eigen::Vector3d& vec)
+{
+  return std::isfinite(vec.x()) && std::isfinite(vec.y()) && std::isfinite(vec.z());
+}
+
+double elapsedMs(const std::chrono::steady_clock::time_point& start,
+                 const std::chrono::steady_clock::time_point& stop)
+{
+  return std::chrono::duration<double, std::milli>(stop - start).count();
+}
+
+std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>> localCloudAroundPoint(
+    const std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>>& cloud,
+    const Eigen::Vector3d&                                  center,
+    const double                                            radius)
+{
+  auto local_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>();
+  if (!cloud || cloud->empty()) {
+    return local_cloud;
+  }
+
+  const double radius_sq = radius * radius;
+  local_cloud->points.reserve(std::min<std::size_t>(cloud->points.size(), 20000));
+  for (const auto& point : cloud->points) {
+    if (!isFinitePoint(point)) {
+      continue;
+    }
+
+    const double dx = static_cast<double>(point.x) - center.x();
+    const double dy = static_cast<double>(point.y) - center.y();
+    const double dz = static_cast<double>(point.z) - center.z();
+    if (dx * dx + dy * dy + dz * dz <= radius_sq) {
+      local_cloud->points.push_back(point);
+    }
+  }
+
+  local_cloud->width = static_cast<std::uint32_t>(local_cloud->points.size());
+  local_cloud->height = 1;
+  local_cloud->is_dense = true;
+  return local_cloud;
+}
+
+bool containsNearPoint(const std::vector<Eigen::Vector3d>& points,
+                       const Eigen::Vector3d&              point,
+                       const double                        tolerance_sq)
+{
+  for (const auto& existing_point : points) {
+    if ((existing_point - point).squaredNorm() <= tolerance_sq) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::size_t appendNearAgentCell(std::vector<Eigen::Vector3d>&       cell,
+                                const std::vector<Eigen::Vector3d>& source_cell,
+                                const Eigen::Vector3d&              agent_pos,
+                                const double                        radius,
+                                const double                        duplicate_tolerance)
+{
+  const double radius_sq = radius * radius;
+  const double duplicate_tolerance_sq = duplicate_tolerance * duplicate_tolerance;
+  std::size_t added = 0;
+
+  for (const auto& point : source_cell) {
+    if ((point - agent_pos).squaredNorm() > radius_sq) {
+      continue;
+    }
+
+    if (containsNearPoint(cell, point, duplicate_tolerance_sq)) {
+      continue;
+    }
+
+    cell.push_back(point);
+    ++added;
+  }
+
+  return added;
+}
+
 }  // namespace
 
 RBLController::RBLController(const RBLParams& params) : params_(params)  // //{
 {
-  radius_sensing_ = params_.radius / params_.cwvd_obs + sqrt((params_.voxel_size / 2) * (params_.voxel_size / 2));
+  radius_sensing_ = params_.radius + params_.encumbrance + sqrt(3 * pow(params_.voxel_size / 2.0, 2));
   beta_           = params_.beta_min;
   if (params.replanner) {
     ReplannerParams replanner_params;
@@ -213,6 +298,7 @@ bool RBLController::inputsHealthy(const Eigen::Vector3d&                        
 
 std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
 {
+  const auto total_start = std::chrono::steady_clock::now();
   mrs_msgs::msg::Reference p_ref;
 
   if (!has_goal_) {
@@ -230,6 +316,7 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
     return pRefAgent(agent_pos_, rpy_[2]);
   }
 
+  const auto replanner_start = std::chrono::steady_clock::now();
   if (params_.replanner) {
     const bool replanner_idle =
         !replanner_future_.valid() ||
@@ -279,6 +366,7 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
       destination_ = goal_;   // or keep previous destination_
     }
   }
+  const auto replanner_stop = std::chrono::steady_clock::now();
   // if (params_.replanner) {
   //   // Trigger replanner asynchronously
   //   if (rbl_replanner_->replanTimer()) {
@@ -320,6 +408,7 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
   cell_A_.clear();
   sensed_cell_A_.clear();
   cell_S_.clear();
+  const auto partition_start = std::chrono::steady_clock::now();
   createAndPartitionCellA(cell_A_,
                           sensed_cell_A_,
                           cell_S_,
@@ -334,6 +423,7 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
                           c1_,
                           seed_b_,
                           threshold_active_);
+  const auto partition_stop = std::chrono::steady_clock::now();
 
   if (shouldLogRbl("cells_after_partition", 1.0)) {
     std::cout << "[RBLController][cells] cell_S=" << cell_S_.size()
@@ -350,6 +440,7 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
 
 
   std::vector<Eigen::Vector3d> emptyVec;
+  const auto centroid_start = std::chrono::steady_clock::now();
   if (params_.replanner) {
     computeCentroid(c1_full_,
                     agent_pos_,
@@ -460,12 +551,17 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
                params_.beta_min,
                params_.dt);
   }
+  const auto centroid_stop = std::chrono::steady_clock::now();
   // Eigen::Vector3d c1_full_cell = c1_;
   // if (params_.move_centroid_to_sensed_cell) {
+    const auto snap_start = std::chrono::steady_clock::now();
     c1_ = movePointToCell(c1_full_, sensed_cell_A_);
+    const auto snap_stop = std::chrono::steady_clock::now();
   // }
   // if c1_ is very close to uav.
+  const auto ref_start = std::chrono::steady_clock::now();
   determineNextRef(p_ref, agent_pos_, waypoint_, goal_, c1_, c1_full_, rpy_, path_);
+  const auto ref_stop = std::chrono::steady_clock::now();
 
   if (shouldLogRbl("reference_out", 0.5)) {
     const Eigen::Vector3d ref(p_ref.position.x, p_ref.position.y, p_ref.position.z);
@@ -478,6 +574,21 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
               << ", heading=" << p_ref.heading
               << ", limited_fov=" << params_.limited_fov
               << ", threshold_active=" << threshold_active_ << std::endl;
+  }
+
+  if (shouldLogRbl("get_next_ref_timing", 1.0)) {
+    const auto total_stop = std::chrono::steady_clock::now();
+    std::cout << "[RBLController][timing] getNextRef total_ms=" << elapsedMs(total_start, total_stop)
+              << ", replanner_ms=" << elapsedMs(replanner_start, replanner_stop)
+              << ", partition_ms=" << elapsedMs(partition_start, partition_stop)
+              << ", centroid_apply_ms=" << elapsedMs(centroid_start, centroid_stop)
+              << ", snap_ms=" << elapsedMs(snap_start, snap_stop)
+              << ", ref_ms=" << elapsedMs(ref_start, ref_stop)
+              << ", cell_S=" << cell_S_.size()
+              << ", cell_A=" << cell_A_.size()
+              << ", sensed_A=" << sensed_cell_A_.size()
+              << ", planes=" << plane_normals_.size()
+              << ", path=" << path_.size() << std::endl;
   }
 
   return p_ref;
@@ -521,6 +632,16 @@ std::vector<Eigen::Vector3d> RBLController::getCellA()  // //{
 std::vector<Eigen::Vector3d> RBLController::getSensedCellA()
 {
   return sensed_cell_A_;
+}
+
+std::vector<Eigen::Vector3d> RBLController::getCellS()
+{
+  return cell_S_;
+}
+
+std::vector<Eigen::Vector3d> RBLController::getLocalObstaclePoints()
+{
+  return local_obstacle_points_;
 }
 
 std::vector<Eigen::Vector3d> RBLController::getInflatedMap()  // //{
@@ -672,17 +793,52 @@ void RBLController::partitionCellA(std::vector<Eigen::Vector3d>&                
 {
   // (void)neighbors;     // TODO - currently unused
 
+  cell_A.clear();
   std::vector<bool>                   remove_mask(cell_S.size(), false);
-  pcl::PointCloud<pcl::PointXYZI>::Ptr boost_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>(*cloud);
 
   plane_normals.clear();
   plane_points.clear();
 
+  if (!isFiniteVector(agent_pos)) {
+    std::cout << "[RBLController][partition] invalid agent position " << vecToString(agent_pos)
+              << ", returning empty cell_A" << std::endl;
+    return;
+  }
+
+  if (!cloud) {
+    std::cout << "[RBLController][partition] null cloud, returning cell_S as cell_A. cell_S=" << cell_S.size()
+              << std::endl;
+    cell_A = cell_S;
+    return;
+  }
+
+  const auto partition_start = std::chrono::steady_clock::now();
+  const std::size_t input_cloud_size = cloud->size();
+  if (shouldLogRbl("partition_start", 0.5)) {
+    std::cout << "[RBLController][partition] start cell_S=" << cell_S.size()
+              << ", cloud=" << input_cloud_size
+              << ", neighbors=" << neighbors.size()
+              << ", radius_sensing=" << radius_sensing_
+              << ", agent=" << vecToString(agent_pos) << std::endl;
+  }
+
   // check other agents
+  std::size_t skipped_neighbors = 0;
   for (const auto& neighbor : neighbors) {
+    if (!isFiniteVector(neighbor)) {
+      ++skipped_neighbors;
+      continue;
+    }
+
+    const double neighbor_dist = (neighbor - agent_pos).norm();
+    if (neighbor_dist <= 1e-6) {
+      ++skipped_neighbors;
+      continue;
+    }
+
     double          Delta_i_j = 2 * params_.encumbrance;
-    Eigen::Vector3d tilde_p_i = Delta_i_j * (neighbor - agent_pos) / ((neighbor - agent_pos).norm()) + agent_pos;
-    Eigen::Vector3d tilde_p_j = Delta_i_j * (agent_pos - neighbor) / ((agent_pos - neighbor).norm()) + neighbor;
+    Eigen::Vector3d tilde_p_i = Delta_i_j * (neighbor - agent_pos) / neighbor_dist + agent_pos;
+    Eigen::Vector3d tilde_p_j = Delta_i_j * (agent_pos - neighbor) / neighbor_dist + neighbor;
 
     Eigen::Vector3d plane_norm, plane_point;
     if ((agent_pos - tilde_p_i).norm() <= (agent_pos - tilde_p_j).norm()) { //if encum of both <= n 
@@ -693,17 +849,40 @@ void RBLController::partitionCellA(std::vector<Eigen::Vector3d>&                
       plane_norm  = tilde_p_i - tilde_p_j;
       plane_point = tilde_p_j;
     }
+    if (!isFiniteVector(plane_norm) || !isFiniteVector(plane_point) || plane_norm.squaredNorm() <= 1e-12) {
+      ++skipped_neighbors;
+      continue;
+    }
     plane_normals.push_back(plane_norm);
     plane_points.push_back(plane_point);
   }
 
   pcl::KdTreeFLANN<pcl::PointXYZI> kdtree;
+  pcl::PointCloud<pcl::PointXYZI>::Ptr boost_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>();
+  boost_cloud->points.reserve(cloud->points.size());
+  std::size_t nonfinite_cloud_points = 0;
+  for (const auto& point : cloud->points) {
+    if (!isFinitePoint(point)) {
+      ++nonfinite_cloud_points;
+      continue;
+    }
+    boost_cloud->points.push_back(point);
+  }
+  boost_cloud->width = static_cast<std::uint32_t>(boost_cloud->points.size());
+  boost_cloud->height = 1;
+  boost_cloud->is_dense = true;
 
   bool check_cloud = false;
-  if (cloud->size() > 0) {
+  if (!boost_cloud->empty()) {
     kdtree.setInputCloud(boost_cloud);
     check_cloud = true;
   }
+
+  std::size_t radius_hits = 0;
+  std::size_t invalid_radius_indices = 0;
+  std::size_t skipped_voxels = 0;
+  std::size_t skipped_nonintersecting_planes = 0;
+  std::size_t obstacle_planes = 0;
 
   if (check_cloud) {
     std::vector<int>   k_indices(1);
@@ -719,17 +898,34 @@ void RBLController::partitionCellA(std::vector<Eigen::Vector3d>&                
     searchPoint.intensity = 1.0f;
     // pcl::PointXYZI searchPoint(agent_pos.x(), agent_pos.y(), agent_pos.z(), 1.0f);
     if (kdtree.radiusSearch(searchPoint, radius_sensing_, radius_indices, radius_sqr_distances) > 0) {
+      radius_hits = radius_indices.size();
+      local_obstacle_points_.reserve(local_obstacle_points_.size() + radius_indices.size());
       for (size_t i = 0; i < radius_indices.size(); ++i) {
+        if (radius_indices[i] < 0 || static_cast<std::size_t>(radius_indices[i]) >= boost_cloud->points.size()) {
+          ++invalid_radius_indices;
+          continue;
+        }
         const auto& current_voxel = boost_cloud->points[radius_indices[i]];
 
         Eigen::Vector3d voxel_point(current_voxel.x, current_voxel.y, current_voxel.z);
+        if (!isFiniteVector(voxel_point)) {
+          ++skipped_voxels;
+          continue;
+        }
+
+        const double voxel_dist = (voxel_point - agent_pos).norm();
+        if (voxel_dist <= 1e-6) {
+          ++skipped_voxels;
+          continue;
+        }
+
         Eigen::Vector3d closest_p_on_vox;
         closestPointOnVoxel(closest_p_on_vox, agent_pos, voxel_point, params_.voxel_size);
         double          Delta_i_j = params_.encumbrance + sqrt(3 * pow(params_.voxel_size / 2.0, 2));
         Eigen::Vector3d tilde_p_i =
-            Delta_i_j * (voxel_point - agent_pos) / (voxel_point - agent_pos).norm() + agent_pos;
+            Delta_i_j * (voxel_point - agent_pos) / voxel_dist + agent_pos;
         Eigen::Vector3d tilde_p_j =
-            Delta_i_j * (agent_pos - voxel_point) / (agent_pos - voxel_point).norm() + voxel_point;
+            Delta_i_j * (agent_pos - voxel_point) / voxel_dist + voxel_point;
 
         Eigen::Vector3d plane_norm, plane_point;
         if ((agent_pos - tilde_p_i).norm() <= (agent_pos - tilde_p_j).norm()) {
@@ -740,8 +936,23 @@ void RBLController::partitionCellA(std::vector<Eigen::Vector3d>&                
           plane_norm  = tilde_p_i - tilde_p_j;
           plane_point = tilde_p_j;
         }
+        if (!isFiniteVector(plane_norm) || !isFiniteVector(plane_point) || plane_norm.squaredNorm() <= 1e-12) {
+          ++skipped_voxels;
+          continue;
+        }
+
+        const double plane_norm_len = plane_norm.norm();
+        const double plane_offset   = plane_norm.dot(plane_point);
+        const double agent_side     = plane_norm.dot(agent_pos) - plane_offset;
+        if (agent_side + params_.radius * plane_norm_len < 0.0) {
+          ++skipped_nonintersecting_planes;
+          continue;
+        }
+
+        local_obstacle_points_.push_back(voxel_point);
         plane_normals.push_back(plane_norm);
         plane_points.push_back(plane_point);
+        ++obstacle_planes;
       }
     }
   }
@@ -751,6 +962,9 @@ void RBLController::partitionCellA(std::vector<Eigen::Vector3d>&                
   // #pragma omp parallel for
   for (int j = 0; j < static_cast<int>(plane_normals.size()); ++j) {
     plane_offsets[j] = plane_normals[j].dot(plane_points[j]);
+    if (!std::isfinite(plane_offsets[j])) {
+      plane_offsets[j] = std::numeric_limits<double>::quiet_NaN();
+    }
   }
 
 
@@ -763,6 +977,9 @@ void RBLController::partitionCellA(std::vector<Eigen::Vector3d>&                
     bool                   should_remove = false;
 
     for (size_t j = 0; j < plane_normals.size(); ++j) {
+      if (!std::isfinite(plane_offsets[j])) {
+        continue;
+      }
       double side = plane_normals[j].dot(point) - plane_offsets[j];
       if (side >= 0) {
         should_remove = true;
@@ -778,6 +995,25 @@ void RBLController::partitionCellA(std::vector<Eigen::Vector3d>&                
     if (!remove_mask[i]) {
       cell_A.push_back(cell_S[i]);
     }
+  }
+
+  if (shouldLogRbl("partition_done", 0.5)) {
+    const auto partition_stop = std::chrono::steady_clock::now();
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(partition_stop - partition_start).count();
+    std::cout << "[RBLController][partition] done cell_A=" << cell_A.size()
+              << ", cell_S=" << cell_S.size()
+              << ", input_cloud=" << input_cloud_size
+              << ", finite_cloud=" << boost_cloud->size()
+              << ", nonfinite_cloud=" << nonfinite_cloud_points
+              << ", radius_hits=" << radius_hits
+              << ", obstacle_planes=" << obstacle_planes
+              << ", total_planes=" << plane_normals.size()
+              << ", skipped_neighbors=" << skipped_neighbors
+              << ", skipped_voxels=" << skipped_voxels
+              << ", skipped_nonintersecting_planes=" << skipped_nonintersecting_planes
+              << ", invalid_radius_indices=" << invalid_radius_indices
+              << ", elapsed_ms=" << elapsed_ms << std::endl;
   }
 }  // //}
 
@@ -1046,12 +1282,15 @@ void RBLController::createAndPartitionCellA(std::vector<Eigen::Vector3d>&       
                                             Eigen::Vector3d&                                 seed_b,
                                             bool&                                            threshold_active)
 {
+const auto create_start = std::chrono::steady_clock::now();
 std::vector<Eigen::Vector3d>                     cell_B;
 std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>> cloud_high_intensity(new pcl::PointCloud<pcl::PointXYZI>());
 std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>> cloud_low_intensity(new pcl::PointCloud<pcl::PointXYZI>());
+local_obstacle_points_.clear();
 
 constexpr float INTENSITY_THRESH = 0.99f;
 
+const auto split_start = std::chrono::steady_clock::now();
 for (const auto& p : cloud->points) {
   if (p.intensity >= INTENSITY_THRESH) {
     cloud_high_intensity->points.push_back(p);
@@ -1067,6 +1306,7 @@ cloud_high_intensity->is_dense = true;
 cloud_low_intensity->width = static_cast<std::uint32_t>(cloud_low_intensity->points.size());
 cloud_low_intensity->height = 1;
 cloud_low_intensity->is_dense = true;
+const auto split_stop = std::chrono::steady_clock::now();
 
 if (shouldLogRbl("cloud_split", 1.0)) {
   std::cout << "[RBLController][cloud] total=" << (cloud ? cloud->size() : 0)
@@ -1103,12 +1343,14 @@ if (shouldLogRbl("cloud_split", 1.0)) {
   //   params_.boundary_threshold = 0.1;
   //   std::cout << "slow: "<< agent_vel_.norm() << std::endl;
   // }
+  const auto cell_s_start = std::chrono::steady_clock::now();
   if (params_.only_2d) {  // 2D case
     cell_S = getpointsInsideCircle(agent_pos, params_.radius, params_.step_size);
   }
   else {  // 3D case
     pointsInsideSphere(cell_S, agent_pos, params_.radius, params_.step_size, altitude);
   }
+  const auto cell_s_stop = std::chrono::steady_clock::now();
   if (shouldLogRbl("cell_s_created", 1.0)) {
     std::cout << "[RBLController][cells] generated cell_S=" << cell_S.size()
               << ", radius=" << params_.radius
@@ -1120,17 +1362,59 @@ if (shouldLogRbl("cloud_split", 1.0)) {
       std::cout << "[RBLController]: group states empty." << std::endl;
   }
   // if (!group_states_.empty() || (cloud && cloud->size() > 0)) {
+    const bool has_intensity_split = !cloud_high_intensity->empty() && !cloud_low_intensity->empty();
+    const auto cell_a_start = std::chrono::steady_clock::now();
+    std::string cell_a_mode = "classic";
+    double ciri_local_cloud_ms = 0.0;
+    std::size_t ciri_source_cloud_size = 0;
+    std::size_t ciri_local_cloud_size = 0;
     if (params_.ciri) {
-      // std::cout << "[RBLController]: cell_b "<< cell_B.size() << std::endl;
-      partitionCellA(cell_B, cell_S, plane_normals, plane_points, agent_pos, neighbors_pos, cloud_high_intensity);
-      if (shouldLogRbl("cell_b_after_partition", 1.0)) {
-        std::cout << "[RBLController][cells] cell_B=" << cell_B.size()
-                  << " after high-intensity partition, planes=" << plane_normals.size() << std::endl;
+      cell_a_mode = has_intensity_split ? "ciri_split" : "ciri_full_cloud";
+      std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>> ciri_cloud;
+
+      if (has_intensity_split) {
+        // std::cout << "[RBLController]: cell_b "<< cell_B.size() << std::endl;
+        partitionCellA(cell_B, cell_S, plane_normals, plane_points, agent_pos, neighbors_pos, cloud_high_intensity);
+        const auto ciri_local_start = std::chrono::steady_clock::now();
+        ciri_source_cloud_size = cloud_low_intensity->size();
+        ciri_cloud = localCloudAroundPoint(cloud_low_intensity, agent_pos, radius_sensing_);
+        ciri_local_cloud_size = ciri_cloud->size();
+        ciri_local_cloud_ms = elapsedMs(ciri_local_start, std::chrono::steady_clock::now());
+        local_obstacle_points_.reserve(ciri_cloud->points.size());
+        for (const auto& point : ciri_cloud->points) {
+          local_obstacle_points_.push_back(Eigen::Vector3d(point.x, point.y, point.z));
+        }
+        if (shouldLogRbl("cell_b_after_partition", 1.0)) {
+          std::cout << "[RBLController][cells] cell_B=" << cell_B.size()
+                    << " after high-intensity partition, planes=" << plane_normals.size() << std::endl;
+        }
       }
+      else {
+        cell_B = cell_S;
+        const auto ciri_local_start = std::chrono::steady_clock::now();
+        ciri_source_cloud_size = cloud ? cloud->size() : 0;
+        ciri_cloud = localCloudAroundPoint(cloud, agent_pos, radius_sensing_);
+        ciri_local_cloud_size = ciri_cloud->size();
+        ciri_local_cloud_ms = elapsedMs(ciri_local_start, std::chrono::steady_clock::now());
+        local_obstacle_points_.reserve(ciri_cloud->points.size());
+        for (const auto& point : ciri_cloud->points) {
+          local_obstacle_points_.push_back(Eigen::Vector3d(point.x, point.y, point.z));
+        }
+        if (shouldLogRbl("ciri_unsplit_cloud", 1.0)) {
+          std::cout << "[RBLController][ciri] no usable intensity split; trying CIRI with local full-cloud crop. "
+                    << "cell_B=" << cell_B.size()
+                    << ", source_cloud=" << ciri_source_cloud_size
+                    << ", ciri_cloud=" << ciri_local_cloud_size
+                    << ", crop_radius=" << radius_sensing_
+                    << ", high_intensity=" << cloud_high_intensity->size()
+                    << ", low_intensity=" << cloud_low_intensity->size() << std::endl;
+        }
+      }
+
       /* partitionCellA(cell_B, cell_S, plane_normals, plane_points, agent_pos, group_positions, cloud_high_intensity); */
       // std::cout << "[RBLController]: cell_b1 "<< cell_B.size() << std::endl;
       bool success = false;
-      if (!cloud_low_intensity->empty()) {
+      if (ciri_cloud && !ciri_cloud->empty()) {
         success = partitionCellACiri(cell_A,
                                      cell_B,
                                      plane_normals,
@@ -1138,13 +1422,13 @@ if (shouldLogRbl("cloud_split", 1.0)) {
                                      agent_pos,
                                      waypoint,
                                      neighbors_pos,
-                                     cloud_low_intensity,
+                                     ciri_cloud,
                                      c1,
                                      seed_b,
                                      threshold_active);
       }
       else {
-        std::cout << "[RBLController]: Skipping Ciri, low-intensity cloud is empty." << std::endl;
+        std::cout << "[RBLController]: Skipping Ciri, CIRI cloud is empty." << std::endl;
       }
       if (cell_B == cell_A) {
         std::cout << "[RBLController]: Cell A = Cell B" << std::endl;
@@ -1154,6 +1438,7 @@ if (shouldLogRbl("cloud_split", 1.0)) {
         std::cout << "[RBLController]: Ciri failed or empty cell_A. Using classic partition. success=" << success
                   << ", cell_A=" << cell_A.size() << std::endl;
         cell_A.clear();
+        cell_a_mode += "_fallback_classic";
         partitionCellA(cell_A, cell_S, plane_normals, plane_points, agent_pos, neighbors_pos, cloud);
         seed_b = agent_pos;
         if (shouldLogRbl("classic_after_ciri_fallback", 1.0)) {
@@ -1169,17 +1454,46 @@ if (shouldLogRbl("cloud_split", 1.0)) {
                   << ", planes=" << plane_normals.size() << std::endl;
       }
     }
+    const auto cell_a_stop = std::chrono::steady_clock::now();
   // }
   // else {
   //   cell_A = cell_S;
   // }
+  const double always_allowed_radius = std::max(params_.encumbrance, 2.0 * params_.step_size);
+  const auto sensed_start = std::chrono::steady_clock::now();
   sensed_cell_A = computeActivelySensedCell(cell_A, agent_pos, rpy);
+  const std::size_t always_allowed_sensed_a =
+      appendNearAgentCell(sensed_cell_A, cell_S, agent_pos, always_allowed_radius, 0.5 * params_.step_size);
+  const auto sensed_stop = std::chrono::steady_clock::now();
   if (shouldLogRbl("sensed_cell", 1.0)) {
     std::cout << "[RBLController][cells] sensed_cell_A=" << sensed_cell_A.size()
               << " from cell_A=" << cell_A.size()
+              << ", always_allowed_radius=" << always_allowed_radius
+              << ", always_allowed_cell_A_added=0"
+              << ", always_allowed_sensed_A_added=" << always_allowed_sensed_a
               << ", lidar_tilt=" << params_.lidar_tilt
               << ", lidar_fov=" << params_.lidar_fov
               << ", rpy=" << vecToString(rpy) << std::endl;
+  }
+  if (shouldLogRbl("create_partition_timing", 1.0)) {
+    const auto create_stop = std::chrono::steady_clock::now();
+    std::cout << "[RBLController][timing] createAndPartition total_ms=" << elapsedMs(create_start, create_stop)
+              << ", split_ms=" << elapsedMs(split_start, split_stop)
+              << ", cell_s_ms=" << elapsedMs(cell_s_start, cell_s_stop)
+              << ", cell_a_ms=" << elapsedMs(cell_a_start, cell_a_stop)
+              << ", sensed_ms=" << elapsedMs(sensed_start, sensed_stop)
+              << ", mode=" << cell_a_mode
+              << ", ciri_source_cloud=" << ciri_source_cloud_size
+              << ", ciri_local_cloud=" << ciri_local_cloud_size
+              << ", ciri_local_cloud_ms=" << ciri_local_cloud_ms
+              << ", always_allowed_radius=" << always_allowed_radius
+              << ", always_allowed_cell_A_added=0"
+              << ", always_allowed_sensed_A_added=" << always_allowed_sensed_a
+              << ", cell_S=" << cell_S.size()
+              << ", cell_A=" << cell_A.size()
+              << ", sensed_A=" << sensed_cell_A.size()
+              << ", planes=" << plane_normals.size()
+              << ", cloud=" << (cloud ? cloud->size() : 0) << std::endl;
   }
 }  // //}
 

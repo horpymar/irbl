@@ -5,8 +5,11 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
+#include <algorithm>
+#include <functional>
 #include <iostream>
 #include <cmath>
+#include <limits>
 #include <numeric> 
 #include <tuple>
 #include <vector>
@@ -141,8 +144,8 @@ private:
   void calculate1dSquaredDistance(std::vector<int>& data, int length, int stride);
   std::vector<Eigen::Vector3d> gridPathToWorldPath(std::vector<std::tuple<int, int ,int>>& _path);
   std::vector<std::tuple<int, int, int>> worldPathToGridPath(const std::vector<Eigen::Vector3d>& path);
-  std::vector<std::tuple<int, int, int>> smoothPath(const std::vector<std::tuple<int, int ,int>>& _path, const std::optional<VoxelGrid>& grid);
-  bool canConnectPoints(const std::tuple<int, int, int>& p1, const std::tuple<int, int, int>& p2, const std::optional<VoxelGrid>& grid);
+  std::vector<std::tuple<int, int, int>> smoothPath(const std::vector<std::tuple<int, int ,int>>& _path, const std::optional<VoxelGrid>& grid, const std::optional<VoxelGrid>* clearance_grid = nullptr);
+  bool canConnectPoints(const std::tuple<int, int, int>& p1, const std::tuple<int, int, int>& p2, const std::optional<VoxelGrid>& grid, const std::optional<VoxelGrid>* clearance_grid = nullptr);
   std::vector<std::tuple<int, int ,int>> AStarPlan(const std::tuple<int, int, int> _start, const std::tuple<int, int, int> _goal, const std::vector<std::tuple<int, int, int>>& _path, const std::optional<VoxelGrid>& grid, const std::optional<VoxelGrid>& clearance_grid);
   double deviationPenalty(const std::vector<std::tuple<int, int, int>>& _path, const std::tuple<int, int, int>& _p1, const std::tuple<int, int, int>& _p2);
   double euclideanDistance(const std::tuple<int, int, int>& p1, const std::tuple<int, int, int>& p2);

@@ -7,5 +7,5 @@ ros2 run tf2_ros static_transform_publisher \
   --roll 0.0 \
   --pitch 0.0 \
   --yaw 0.0 \
-  --frame-id $UAV_NAME/fixed_origin\
+  --frame-id $UAV_NAME/world_origin \
   --child-frame-id uav2/world_origin

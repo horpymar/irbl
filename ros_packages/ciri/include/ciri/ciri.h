@@ -99,11 +99,7 @@ public:
 
   // bool noPointsInside(std::vector<Eigen::Vector3f>& pc, const Eigen::Matrix3d& R, const Eigen::Vector3f& r, const Eigen::Vector3f& p) const;
 
-  bool pointsInside(const Eigen::Matrix3Xf& pc, Eigen::Matrix<float, 3, 3>& out, int& min_pt_id) const;
-
-  // bool pointsInside(const Eigen::Matrix3Xd& pc, Eigen::Matrix<double, 3, 3>& out, int& min_pt_id) const;
-
-  bool pointsInside(const Eigen::Matrix<float, 3, 3>& pc, Eigen::Matrix<float, 3, 3>& out, int& min_pt_id) const;
+  bool pointsInside(const Eigen::Matrix3Xf& pc, Eigen::Matrix3Xf& out, int& min_pt_id) const;
 
   /// Check if the point is inside, non-exclusive
   bool inside(const Eigen::Vector3f& pt) const;

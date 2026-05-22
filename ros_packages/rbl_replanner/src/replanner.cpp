@@ -82,9 +82,7 @@ std::vector<Eigen::Vector3d> RBLReplanner::plan()  // //{
   _path_ = worldPathToGridPath(path_);
 
   if (!shouldReplan(path_, agent_pos_, _path_, _inflated_grid_)) {
-    std::vector<std::tuple<int, int, int>> _smooth_path = smoothPath(_path_, _inflated_grid_);
-    std::vector<Eigen::Vector3d>           smooth_path_ = gridPathToWorldPath(_smooth_path);
-    return smooth_path_;
+    return smooth_path_.empty() ? path_ : smooth_path_;
   }
 
   start = std::chrono::high_resolution_clock::now();
@@ -103,10 +101,10 @@ std::vector<Eigen::Vector3d> RBLReplanner::plan()  // //{
   // std::endl; std::cout << "[RBLReplanner]: Overall planning took: " << (duration_inflate.count() +
   // duration_clearance.count() + duration_a_star.count()) / 1000 << " miliseconds" << std::endl;
 
-  std::vector<std::tuple<int, int, int>> _smooth_path = smoothPath(_path_, _inflated_grid_);
+  std::vector<std::tuple<int, int, int>> _smooth_path = smoothPath(_path_, _inflated_grid_, &_clearance_grid_);
   // std::cout << "[RBLReplanner]: Path from A*: " << _path_.size() << ", smoothed path: " << _smooth_path.size() <<
   // std::endl;
-  std::vector<Eigen::Vector3d> smooth_path_ = gridPathToWorldPath(_smooth_path);
+  smooth_path_ = gridPathToWorldPath(_smooth_path);
   // path_ = gridPathToWorldPath(_smooth_path);
   // interpolate path
 
@@ -188,11 +186,20 @@ bool RBLReplanner::pathBlocked(std::vector<std::tuple<int,
                                                       int>> _path,
                                std::optional<VoxelGrid>&    grid)  // //{
 {
+  if (!grid.has_value()) {
+    return true;
+  }
+
   int x, y, z;
   for (size_t i = 0; i < _path.size(); ++i) {
     x = std::get<0>(_path[i]);
     y = std::get<1>(_path[i]);
     z = std::get<2>(_path[i]);
+
+    if (x < 0 || x >= grid->X || y < 0 || y >= grid->Y || z < 0 || z >= grid->Z) {
+      return true;
+    }
+
     if (grid->at(x, y, z) == 1) {
       return true;
     }
@@ -346,46 +353,82 @@ void RBLReplanner::calculateClearanceGrid(std::optional<VoxelGrid>&       cleara
   const VoxelGrid& in_grid  = *input_grid;
   VoxelGrid&       out_grid = *clearance_grid;
 
-  const int occupied_cost = 0;
-  const int free_cost     = std::numeric_limits<int>::max();
+  const auto flatIndex = [&out_grid](const int x, const int y, const int z) {
+    return x * out_grid.Y * out_grid.Z + y * out_grid.Z + z;
+  };
+
+  const double infinity = std::numeric_limits<double>::infinity();
+  std::vector<double> distances(out_grid.data.size(), infinity);
+  using QueueItem = std::pair<double, std::tuple<int, int, int>>;
+  std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> queue;
 
   for (int x = 0; x < in_grid.X; ++x) {
     for (int y = 0; y < in_grid.Y; ++y) {
       for (int z = 0; z < in_grid.Z; ++z) {
-        if (in_grid.at(x, y, z) == 0) {  // Free space
-          out_grid.at(x, y, z) = free_cost;
-        }
-        else {  // Obstacle
-          out_grid.at(x, y, z) = occupied_cost;
+        if (in_grid.at(x, y, z) != 0) {
+          const int idx = flatIndex(x, y, z);
+          distances[idx] = 0.0;
+          queue.push({0.0, {x, y, z}});
         }
       }
     }
   }
 
-  // Pass 1: X-axis pass
-  for (int y = 0; y < out_grid.Y; ++y) {
-    for (int z = 0; z < out_grid.Z; ++z) {
-      calculate1dSquaredDistance(out_grid.data, out_grid.X, out_grid.Y * out_grid.Z);
+  if (queue.empty()) {
+    std::fill(out_grid.data.begin(), out_grid.data.end(), std::max({out_grid.X, out_grid.Y, out_grid.Z}));
+    return;
+  }
+
+  int offsets[26][3];
+  int offset_count = 0;
+  for (int dx = -1; dx <= 1; ++dx) {
+    for (int dy = -1; dy <= 1; ++dy) {
+      for (int dz = -1; dz <= 1; ++dz) {
+        if (dx == 0 && dy == 0 && dz == 0) {
+          continue;
+        }
+        offsets[offset_count][0] = dx;
+        offsets[offset_count][1] = dy;
+        offsets[offset_count][2] = dz;
+        ++offset_count;
+      }
     }
   }
 
-  // Pass 2: Y-axis pass
-  for (int x = 0; x < out_grid.X; ++x) {
-    for (int z = 0; z < out_grid.Z; ++z) {
-      calculate1dSquaredDistance(out_grid.data, out_grid.Y, out_grid.Z);
+  while (!queue.empty()) {
+    auto [distance, position] = queue.top();
+    queue.pop();
+
+    const int x = std::get<0>(position);
+    const int y = std::get<1>(position);
+    const int z = std::get<2>(position);
+    const int idx = flatIndex(x, y, z);
+    if (distance > distances[idx]) {
+      continue;
+    }
+
+    for (int i = 0; i < offset_count; ++i) {
+      const int nx = x + offsets[i][0];
+      const int ny = y + offsets[i][1];
+      const int nz = z + offsets[i][2];
+      if (nx < 0 || nx >= out_grid.X || ny < 0 || ny >= out_grid.Y || nz < 0 || nz >= out_grid.Z) {
+        continue;
+      }
+
+      const double step = std::sqrt(offsets[i][0] * offsets[i][0] +
+                                    offsets[i][1] * offsets[i][1] +
+                                    offsets[i][2] * offsets[i][2]);
+      const double new_distance = distance + step;
+      const int neighbor_idx = flatIndex(nx, ny, nz);
+      if (new_distance < distances[neighbor_idx]) {
+        distances[neighbor_idx] = new_distance;
+        queue.push({new_distance, {nx, ny, nz}});
+      }
     }
   }
 
-  // Pass 3: Z-axis pass
-  for (int x = 0; x < out_grid.X; ++x) {
-    for (int y = 0; y < out_grid.Y; ++y) {
-      calculate1dSquaredDistance(out_grid.data, out_grid.Z, 1);
-    }
-  }
-
-  // Final step: take the square root of all values
   for (size_t i = 0; i < out_grid.data.size(); ++i) {
-    out_grid.data[i] = static_cast<int>(std::sqrt(out_grid.data[i]));
+    out_grid.data[i] = static_cast<int>(std::floor(distances[i]));
   }
 }  // //}
 
@@ -459,7 +502,8 @@ std::vector<std::tuple<int,
 RBLReplanner::smoothPath(const std::vector<std::tuple<int,
                                                       int,
                                                       int>>& _path,
-                         const std::optional<VoxelGrid>&     grid)  // //{
+                         const std::optional<VoxelGrid>&     grid,
+                         const std::optional<VoxelGrid>*     clearance_grid)  // //{
 {
   std::vector<std::tuple<int, int, int>> _smooth_path_fwrd;
   if (_path.empty()) {
@@ -473,7 +517,7 @@ RBLReplanner::smoothPath(const std::vector<std::tuple<int,
   // Forward pass
   size_t last_smooth_idx = 0;
   for (size_t i = 1; i < _path.size(); ++i) {
-    if (canConnectPoints(_path[last_smooth_idx], _path[i], grid)) {
+    if (canConnectPoints(_path[last_smooth_idx], _path[i], grid, clearance_grid)) {
       continue;
     }
     else {
@@ -489,7 +533,7 @@ RBLReplanner::smoothPath(const std::vector<std::tuple<int,
   final_smooth_path.push_back(_smooth_path_fwrd.back());
   size_t last_smooth_idx_bck = _smooth_path_fwrd.size() - 1;
   for (size_t i = _smooth_path_fwrd.size() - 1; i > 0; --i) {
-    if (canConnectPoints(_smooth_path_fwrd[last_smooth_idx_bck], _smooth_path_fwrd[i], grid)) {
+    if (canConnectPoints(_smooth_path_fwrd[last_smooth_idx_bck], _smooth_path_fwrd[i], grid, clearance_grid)) {
       continue;
     }
     else {
@@ -510,8 +554,21 @@ bool RBLReplanner::canConnectPoints(const std::tuple<int,
                                     const std::tuple<int,
                                                      int,
                                                      int>&          p2,
-                                    const std::optional<VoxelGrid>& grid)  // //{
+                                    const std::optional<VoxelGrid>& grid,
+                                    const std::optional<VoxelGrid>* clearance_grid)  // //{
 {
+  if (!grid.has_value()) {
+    return false;
+  }
+
+  const auto inBounds = [&grid](const int x, const int y, const int z) {
+    return x >= 0 && x < grid->X && y >= 0 && y < grid->Y && z >= 0 && z < grid->Z;
+  };
+
+  const bool use_clearance = clearance_grid != nullptr && clearance_grid->has_value();
+  const int  minimum_clearance_cells =
+      std::max(1, static_cast<int>(std::ceil(params_.encumbrance / params_.replanner_vox_size)));
+
   int x1 = std::get<0>(p1);
   int y1 = std::get<1>(p1);
   int z1 = std::get<2>(p1);
@@ -520,10 +577,16 @@ bool RBLReplanner::canConnectPoints(const std::tuple<int,
   int y2 = std::get<1>(p2);
   int z2 = std::get<2>(p2);
 
+  if (!inBounds(x1, y1, z1) || !inBounds(x2, y2, z2)) {
+    return false;
+  }
 
   double dist = std::sqrt(std::pow(x2 - x1, 2) + std::pow(y2 - y1, 2) + std::pow(z2 - z1, 2));
   if (dist == 0.0) {
-    return grid.value().at(x1, y1, z1) == 0;
+    if (grid.value().at(x1, y1, z1) != 0) {
+      return false;
+    }
+    return !use_clearance || clearance_grid->value().at(x1, y1, z1) >= minimum_clearance_cells;
   }
   double step = 0.5;
 
@@ -533,7 +596,15 @@ bool RBLReplanner::canConnectPoints(const std::tuple<int,
     int    y     = static_cast<int>(std::round(y1 + (y2 - y1) * ratio));
     int    z     = static_cast<int>(std::round(z1 + (z2 - z1) * ratio));
 
+    if (!inBounds(x, y, z)) {
+      return false;
+    }
+
     if (grid.value().at(x, y, z) == 1) {
+      return false;
+    }
+
+    if (use_clearance && clearance_grid->value().at(x, y, z) < minimum_clearance_cells) {
       return false;
     }
   }
@@ -556,6 +627,10 @@ RBLReplanner::AStarPlan(const std::tuple<int,
                         const std::optional<VoxelGrid>&     grid,
                         const std::optional<VoxelGrid>&     clearance_grid)  // //{
 {
+  if (!grid.has_value() || !clearance_grid.has_value()) {
+    return {};
+  }
+
   Node* start_node = new Node(nullptr, closestFreeIdx(_start, grid));
   Node* end_node   = new Node(nullptr, closestFreeIdx(_goal, grid));
 
@@ -642,9 +717,9 @@ RBLReplanner::AStarPlan(const std::tuple<int,
       double safety_penalty    = params_.weight_safety / (clearance + params_.eps);
       double deviation_penalty =
           params_.weight_deviation * deviationPenalty(_path, current_node->position, child->position);
-      child->g = current_node->g + dist_parent_child;
+      child->g = current_node->g + dist_parent_child + safety_penalty + deviation_penalty;
       child->h = euclideanDistance(child->position, end_node->position);
-      child->f = child->g + child->h + safety_penalty + deviation_penalty;
+      child->f = child->g + child->h;
 
       open_list.push(child);
     }

@@ -318,9 +318,9 @@ void CIRI::findEllipsoid(const Eigen::Matrix3Xf& pc,
   Eigen::Matrix3f Ri = Eigen::Quaternionf::FromTwoVectors(Eigen::Vector3f::UnitX(), (b - a)).toRotationMatrix();
   Ellipsoid       E(Ri, r, center);
   Eigen::Matrix3f Rf = Ri;
-  Eigen::Matrix<float, 3, 3> obs;
-  int                        min_dis_id;
-  Eigen::Vector3f            pw;
+  Eigen::Matrix3Xf obs;
+  int              min_dis_id;
+  Eigen::Vector3f  pw;
   if (E.pointsInside(pc, obs, min_dis_id)) {
     pw = obs.col(min_dis_id).cast<float>();
     ;
@@ -329,8 +329,8 @@ void CIRI::findEllipsoid(const Eigen::Matrix3Xf& pc,
     out_ell = E;
     return;
   }
-  Eigen::Matrix<float, 3, 3> obs_inside = obs;
-  int                        max_iter   = 100;
+  Eigen::Matrix3Xf obs_inside = obs;
+  int              max_iter   = 100;
   while (max_iter--) {
     Eigen::Vector3f p_e  = Ri.transpose() * (pw - E.d());
     const double    roll = atan2(p_e(2), p_e(1));
@@ -788,9 +788,7 @@ Eigen::VectorXf Ellipsoid::dist(const Eigen::Matrix3Xf& pc_w) const
 }  // //}
 
 bool Ellipsoid::pointsInside(const Eigen::Matrix3Xf& pc,
-                             Eigen::Matrix<float,
-                                           3,
-                                           3>&       out,
+                             Eigen::Matrix3Xf&       out,
                              int&                    min_pt_id) const  // //{
 {
   Eigen::VectorXf              vec = (C_inv_ * (pc.colwise() - d_)).colwise().norm();
@@ -810,48 +808,10 @@ bool Ellipsoid::pointsInside(const Eigen::Matrix3Xf& pc,
     }
   }
   if (!pts.empty()) {
-    // out.resize(3, pts.size());
-    // for (size_t i = 0; i < pts.size(); i++) {
-    //   out.col(i) = pts[i];
-    // }
-    out = Eigen::Map<const Eigen::Matrix<float, 3, -1, Eigen::ColMajor>>(pts[0].data(), 3, pts.size());
-    return true;
-  }
-  else {
-    return false;
-  }
-}  // //}
-
-bool Ellipsoid::pointsInside(const Eigen::Matrix<float,
-                                                 3,
-                                                 3>& pc,
-                             Eigen::Matrix<float,
-                                           3,
-                                           3>&       out,
-                             int&                    min_pt_id) const  // //{
-{
-  Eigen::VectorXf              vec = (C_inv_ * (pc.colwise() - d_)).colwise().norm();
-  std::vector<Eigen::Vector3f> pts;
-  pts.reserve(pc.cols());
-  int cnt        = 0;
-  min_pt_id      = 0;
-  double min_dis = std::numeric_limits<double>::max();
-  for (long int i = 0; i < vec.size(); i++) {
-    if (vec(i) <= 1) {
-      pts.push_back(pc.col(i));
-      if (vec(i) <= min_dis) {
-        min_pt_id = cnt;
-        min_dis   = vec(i);
-      }
-      cnt++;
+    out.resize(3, static_cast<Eigen::Index>(pts.size()));
+    for (size_t i = 0; i < pts.size(); i++) {
+      out.col(static_cast<Eigen::Index>(i)) = pts[i];
     }
-  }
-  if (!pts.empty()) {
-    // out.resize(3, pts.size());
-    // for (size_t i = 0; i < pts.size(); i++) {
-    //   out.col(i) = pts[i];
-    // }
-    out = Eigen::Map<const Eigen::Matrix<float, 3, -1, Eigen::ColMajor>>(pts[0].data(), 3, pts.size());
     return true;
   }
   else {

@@ -1,7 +1,7 @@
 import os
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration, EnvironmentVariable
 
@@ -31,6 +31,8 @@ def generate_launch_description():
     # Launch description + arguments
     # -------------------------------------------------
     ld = LaunchDescription([
+        SetEnvironmentVariable("MALLOC_CHECK_", "3"),
+        SetEnvironmentVariable("MALLOC_PERTURB_", "165"),
 
         DeclareLaunchArgument(
             "uav_name",
