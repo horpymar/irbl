@@ -351,19 +351,26 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
       std::lock_guard<std::mutex> lock(replanner_mutex_);
       auto [planned_generation, new_path, new_inflated_map] = replanner_future_.get();
       if (planned_generation == goal_generation_) {
-        path_ = std::move(new_path);
-        inflated_map_ = std::move(new_inflated_map);
+        if (!new_path.empty()) {
+          path_         = std::move(new_path);
+          inflated_map_ = std::move(new_inflated_map);
+        } else {
+          std::cout << "[RBLController][replanner] received empty path, keeping previous path size=" << path_.size()
+                    << std::endl;
+        }
       }
     }
 
-    // Use path if available, otherwise keep moving
+    // Use path if available; after a new goal, wait here until the first replanner path is ready.
     if (!path_.empty()) {
       waypoint_fixed_distance_ = determineWaypointFixedDistance(path_, agent_pos_, goal_);
-      waypoint_                = determineWaypoint(path_, agent_pos_, goal_, waypoint_);
+      waypoint_                = waypoint_fixed_distance_;
       destination_             = waypoint_;
     } else {
-      // Fallback behavior — DO NOT return
-      destination_ = goal_;   // or keep previous destination_
+      if (shouldLogRbl("waiting_for_replanner_path", 1.0)) {
+        std::cout << "[RBLController][replanner] waiting for first non-empty path before moving to goal" << std::endl;
+      }
+      return pRefAgent(agent_pos_, rpy_[2]);
     }
   }
   const auto replanner_stop = std::chrono::steady_clock::now();
@@ -1960,6 +1967,17 @@ Eigen::Vector3d RBLController::determineWaypointFixedDistance(const std::vector<
                                                               const Eigen::Vector3d&              agent_pos,
                                                               const Eigen::Vector3d&              goal)
 {
+  if (path.empty()) {
+    return goal;
+  }
+
+  const double dist_agent_goal = (goal - agent_pos).norm();
+  const double lookahead       = params_.path_lookahead_distance > 0.0 ? params_.path_lookahead_distance : params_.radius;
+  const double r               = std::min(lookahead, dist_agent_goal);
+  if (r <= 1e-6) {
+    return goal;
+  }
+
   double min_dist_sq         = std::numeric_limits<double>::max();
   size_t    closest_point_index = 0;
   bool found = false;
@@ -1979,9 +1997,6 @@ Eigen::Vector3d RBLController::determineWaypointFixedDistance(const std::vector<
     return path.back();
   }
 
-  // Circle radius
-  double r = params_.radius;
-
   // Iterate over path segments starting from the closest
   for (size_t i = closest_point_index; i < path.size() - 1; ++i) {
     Eigen::Vector3d p1 = path[i];
@@ -1991,6 +2006,9 @@ Eigen::Vector3d RBLController::determineWaypointFixedDistance(const std::vector<
     // Quadratic equation for intersection of segment with circle
     Eigen::Vector3d f = p1 - agent_pos;
     double          a = d.dot(d);
+    if (a <= 1e-12) {
+      continue;
+    }
     double          b = 2 * f.dot(d);
     double          c = f.dot(f) - r * r;
 
@@ -2012,8 +2030,7 @@ Eigen::Vector3d RBLController::determineWaypointFixedDistance(const std::vector<
     }
   }
 
-  // If no intersection found, fall back to goal
-  return goal;
+  return path.back();
 }  // //}
 
 Eigen::Vector3d RBLController::determineWaypoint(const std::vector<Eigen::Vector3d>& path,  // //{
@@ -2021,57 +2038,8 @@ Eigen::Vector3d RBLController::determineWaypoint(const std::vector<Eigen::Vector
                                                  const Eigen::Vector3d&              goal,
                                                  Eigen::Vector3d&                    waypoint)
 {
-  double min_dist_sq         = std::numeric_limits<double>::max();
-  size_t closest_point_index = -1;
-  bool found = false;
-
-  for (size_t i = 0; i < path.size(); ++i) {
-    double dist_sq = (path[i] - agent_pos).squaredNorm();
-    if (dist_sq < min_dist_sq) {
-      min_dist_sq         = dist_sq;
-      closest_point_index = i;
-      found = true;
-    }
-  }
-
-  if (!found || closest_point_index + 1 >= path.size()) {
-    return path.back();
-  }
-
-  double          dist_agent_goal = (goal - agent_pos).norm();
-  // Eigen::Vector3d closest_point   = path[closest_point_index];
-  Eigen::Vector3d next_point      = path[closest_point_index + 1];
-  // Eigen::Vector3d direction_vector = (next_point - closest_point) / (next_point - closest_point).norm();
-  Eigen::Vector3d direction_vector      = (next_point - agent_pos) / (next_point - agent_pos).norm();
-  double          dist_agent_next_point = (next_point - agent_pos).norm();
-  // std::cout << "[RBLController]: Distance agent to next point on path: " << dist_agent_next_point << std::endl;
-  // Eigen::Vector3d waypoint;
-  // if (params_.ciri) {
-  //   waypoint = next_point;
-  // } else {
-  //   waypoint = closest_point + direction_vector * std::min(params_.radius, dist_agent_goal);
-  // }
-  // waypoint = closest_point + a * std::min(params_.radius, dist_agent_goal);
-
-  // waypoint = agent_pos + direction_vector * std::min(params_.radius, dist_agent_next_point);
-  double tmp_min = std::min(params_.radius, dist_agent_next_point);
-  if (dist_agent_goal > params_.radius) {
-    // waypoint = agent_pos + direction_vector * std::max(tmp_min,params_.radius);
-    waypoint = waypoint + 2 * params_.dt *
-                              (agent_pos + direction_vector * std::max(tmp_min, params_.radius / 2) - waypoint) /
-                              (agent_pos + direction_vector * std::max(tmp_min, params_.radius / 2) - waypoint).norm();
-  }
-  else {
-    // waypoint = agent_pos + direction_vector * std::max(tmp_min, dist_agent_goal);
-    // waypoint = agent_pos + direction_vector * std::min(params_.radius, dist_agent_next_point);
-    waypoint = waypoint +
-               2 * params_.dt *
-                   (agent_pos + direction_vector * std::min(params_.radius, dist_agent_next_point) - waypoint) /
-                   (agent_pos + direction_vector * std::min(params_.radius, dist_agent_next_point) - waypoint).norm();
-  }
-
+  waypoint = determineWaypointFixedDistance(path, agent_pos, goal);
   return waypoint;
-  // return next_point;
 }  // //}
 
 void RBLController::determineNextRef(mrs_msgs::msg::Reference&                p_ref,  // //{

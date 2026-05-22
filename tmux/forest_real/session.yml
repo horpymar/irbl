@@ -49,17 +49,20 @@ windows:
   - rbl_controller:
       layout: tiled
       panes:
-        - export UAV_NAME=uav1; waitForCore; ros2 launch rbl_controller_node rbl_controller.launch.py custom_config:=./config/rbl_controller.yaml pcl_topic:=/uav2/losos_server/current_submap_pc
-  - initial_goal:
+        - export UAV_NAME=uav1; export RBL_CONTROLLER_CONFIG=${RBL_CONTROLLER_CONFIG:-./config/rbl_controller.yaml}; waitForCore; ros2 launch rbl_controller_node rbl_controller.launch.py custom_config:=$RBL_CONTROLLER_CONFIG pcl_topic:=/uav2/losos_server/current_submap_pc
+  - benchmark_record:
       layout: tiled
       panes:
-        - >-
-          export UAV_NAME=uav1; waitForRos; until ros2 service list | grep -q "^/uav1/rbl_controller/goto$"; do sleep 1; done; ros2 service call /uav1/rbl_controller/goto mrs_msgs/srv/Vec4 "{goal: [-20.0, 0.0, 1.5, 0.0]}"
+        - export UAV_NAME=uav1; export RBL_CONTROLLER_CONFIG=${RBL_CONTROLLER_CONFIG:-./config/rbl_controller.yaml}; ./benchmark_record.sh
+  - benchmark_goal:
+      layout: tiled
+      panes:
+        - export UAV_NAME=uav1; ./benchmark_goal.sh
   - goto:
       layout: tiled
       synchronize: after
       panes:
-        - 'history -s ros2 service call /uav1/rbl_controller/goto mrs_msgs/srv/Vec4 \"{goal: [20.0, 0.0, 2.0, 0.0]}\"'
+        - 'history -s ros2 service call /uav1/rbl_controller/goto mrs_msgs/srv/Vec4 \"{goal: [90.0, 0.0, 2.0, 0.0]}\"'
   - filter_reflective_uavs:
       layout: tiled
       synchronize: after

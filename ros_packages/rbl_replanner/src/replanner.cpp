@@ -54,6 +54,7 @@ void RBLReplanner::setPCL(const std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>>
 
 std::vector<Eigen::Vector3d> RBLReplanner::getInflatedCloud()  // //{
 {
+  const auto start = std::chrono::steady_clock::now();
   std::vector<Eigen::Vector3d> points;
   for (int x = 0; x < _inflated_grid_->X; ++x) {
     for (int y = 0; y < _inflated_grid_->Y; ++y) {
@@ -65,50 +66,93 @@ std::vector<Eigen::Vector3d> RBLReplanner::getInflatedCloud()  // //{
     }
   }
   // std::cout << "[RBLReplanner]: getting inflated cloud of size: " << points.size() << std::endl;
+  const auto stop = std::chrono::steady_clock::now();
+  std::cout << "[RBLReplanner][timing] getInflatedCloud total_ms="
+            << std::chrono::duration<double, std::milli>(stop - start).count()
+            << ", points=" << points.size()
+            << ", grid=[" << _X_ << "," << _Y_ << "," << _Z_ << "]" << std::endl;
   return points;
 }  // //}
 
 std::vector<Eigen::Vector3d> RBLReplanner::plan()  // //{
 {
-  initializationPlan();
+  const auto total_start = std::chrono::steady_clock::now();
+  const auto elapsedMs = [](const std::chrono::steady_clock::time_point& start,
+                            const std::chrono::steady_clock::time_point& stop) {
+    return std::chrono::duration<double, std::milli>(stop - start).count();
+  };
 
-  auto start = std::chrono::high_resolution_clock::now();
+  const auto init_start = std::chrono::steady_clock::now();
+  initializationPlan();
+  const auto init_stop = std::chrono::steady_clock::now();
+
+  auto start = std::chrono::steady_clock::now();
   fillAndInflateGrid(_inflated_grid_, cloud_);
-  auto stop             = std::chrono::high_resolution_clock::now();
-  auto duration_inflate = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+  auto stop = std::chrono::steady_clock::now();
+  const double inflate_ms = elapsedMs(start, stop);
   // std::cout << "[RBLReplanner]: Time taken by fillAndInflateGrid: " << duration_inflate.count() << " microseconds" <<
   // std::endl;
 
+  const auto world_path_start = std::chrono::steady_clock::now();
   _path_ = worldPathToGridPath(path_);
+  const auto world_path_stop = std::chrono::steady_clock::now();
 
-  if (!shouldReplan(path_, agent_pos_, _path_, _inflated_grid_)) {
-    return smooth_path_.empty() ? path_ : smooth_path_;
+  const auto should_replan_start = std::chrono::steady_clock::now();
+  const bool should_replan = shouldReplan(path_, agent_pos_, _path_, _inflated_grid_);
+  const auto should_replan_stop = std::chrono::steady_clock::now();
+  if (!should_replan) {
+    const auto total_stop = std::chrono::steady_clock::now();
+    std::cout << "[RBLReplanner][timing] plan total_ms=" << elapsedMs(total_start, total_stop)
+              << ", init_ms=" << elapsedMs(init_start, init_stop)
+              << ", inflate_ms=" << inflate_ms
+              << ", world_path_ms=" << elapsedMs(world_path_start, world_path_stop)
+              << ", should_replan_ms=" << elapsedMs(should_replan_start, should_replan_stop)
+              << ", clearance_ms=0"
+              << ", astar_ms=0"
+              << ", world_convert_ms=0"
+              << ", replan=0"
+              << ", cloud=" << (cloud_ ? cloud_->size() : 0)
+              << ", grid=[" << _X_ << "," << _Y_ << "," << _Z_ << "]"
+              << ", path=" << path_.size() << std::endl;
+    return path_;
   }
 
-  start = std::chrono::high_resolution_clock::now();
+  start = std::chrono::steady_clock::now();
   calculateClearanceGrid(_clearance_grid_, _inflated_grid_);
-  stop                    = std::chrono::high_resolution_clock::now();
-  auto duration_clearance = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+  stop = std::chrono::steady_clock::now();
+  const double clearance_ms = elapsedMs(start, stop);
   // std::cout << "[RBLReplanner]: Time taken by calculateClearanceGrid: " << duration_clearance.count() << "
   // microseconds" << std::endl;
 
-  start                = std::chrono::high_resolution_clock::now();
-  _path_               = AStarPlan(_agent_pos_, _goal_, _path_, _inflated_grid_, _clearance_grid_);
-  path_                = gridPathToWorldPath(_path_);
-  stop                 = std::chrono::high_resolution_clock::now();
-  auto duration_a_star = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+  start = std::chrono::steady_clock::now();
+  _path_ = AStarPlan(_agent_pos_, _goal_, _path_, _inflated_grid_, _clearance_grid_);
+  stop = std::chrono::steady_clock::now();
+  const double astar_ms = elapsedMs(start, stop);
+
+  start = std::chrono::steady_clock::now();
+  path_ = gridPathToWorldPath(_path_);
+  stop = std::chrono::steady_clock::now();
+  const double world_convert_ms = elapsedMs(start, stop);
   // std::cout << "[RBLReplanner]: Time taken by AStarPlan: " << duration_a_star.count() << " microseconds" <<
   // std::endl; std::cout << "[RBLReplanner]: Overall planning took: " << (duration_inflate.count() +
   // duration_clearance.count() + duration_a_star.count()) / 1000 << " miliseconds" << std::endl;
 
-  std::vector<std::tuple<int, int, int>> _smooth_path = smoothPath(_path_, _inflated_grid_, &_clearance_grid_);
-  // std::cout << "[RBLReplanner]: Path from A*: " << _path_.size() << ", smoothed path: " << _smooth_path.size() <<
-  // std::endl;
-  smooth_path_ = gridPathToWorldPath(_smooth_path);
-  // path_ = gridPathToWorldPath(_smooth_path);
-  // interpolate path
-
-  return smooth_path_;
+  smooth_path_.clear();
+  const auto total_stop = std::chrono::steady_clock::now();
+  std::cout << "[RBLReplanner][timing] plan total_ms=" << elapsedMs(total_start, total_stop)
+            << ", init_ms=" << elapsedMs(init_start, init_stop)
+            << ", inflate_ms=" << inflate_ms
+            << ", world_path_ms=" << elapsedMs(world_path_start, world_path_stop)
+            << ", should_replan_ms=" << elapsedMs(should_replan_start, should_replan_stop)
+            << ", clearance_ms=" << clearance_ms
+            << ", astar_ms=" << astar_ms
+            << ", world_convert_ms=" << world_convert_ms
+            << ", replan=1"
+            << ", cloud=" << (cloud_ ? cloud_->size() : 0)
+            << ", grid=[" << _X_ << "," << _Y_ << "," << _Z_ << "]"
+            << ", grid_path=" << _path_.size()
+            << ", path=" << path_.size() << std::endl;
+  return path_;
 }  // //}
 
 bool RBLReplanner::shouldReplan(const std::vector<Eigen::Vector3d>& path,
@@ -357,78 +401,107 @@ void RBLReplanner::calculateClearanceGrid(std::optional<VoxelGrid>&       cleara
     return x * out_grid.Y * out_grid.Z + y * out_grid.Z + z;
   };
 
-  const double infinity = std::numeric_limits<double>::infinity();
-  std::vector<double> distances(out_grid.data.size(), infinity);
-  using QueueItem = std::pair<double, std::tuple<int, int, int>>;
-  std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> queue;
+  const double inf = 1e12;
+  std::vector<double> distances(out_grid.data.size(), inf);
+  bool has_occupied = false;
 
   for (int x = 0; x < in_grid.X; ++x) {
     for (int y = 0; y < in_grid.Y; ++y) {
       for (int z = 0; z < in_grid.Z; ++z) {
         if (in_grid.at(x, y, z) != 0) {
-          const int idx = flatIndex(x, y, z);
-          distances[idx] = 0.0;
-          queue.push({0.0, {x, y, z}});
+          distances[flatIndex(x, y, z)] = 0.0;
+          has_occupied = true;
         }
       }
     }
   }
 
-  if (queue.empty()) {
+  if (!has_occupied) {
     std::fill(out_grid.data.begin(), out_grid.data.end(), std::max({out_grid.X, out_grid.Y, out_grid.Z}));
     return;
   }
 
-  int offsets[26][3];
-  int offset_count = 0;
-  for (int dx = -1; dx <= 1; ++dx) {
-    for (int dy = -1; dy <= 1; ++dy) {
-      for (int dz = -1; dz <= 1; ++dz) {
-        if (dx == 0 && dy == 0 && dz == 0) {
-          continue;
+  const auto transformLine = [inf](const std::vector<double>& f, std::vector<double>& d, const int n) {
+    std::vector<int>    v(n);
+    std::vector<double> z(n + 1);
+
+    int k = 0;
+    v[0] = 0;
+    z[0] = -inf;
+    z[1] = inf;
+
+    for (int q = 1; q < n; ++q) {
+      double s = 0.0;
+      while (true) {
+        const int r = v[k];
+        s = ((f[q] + q * q) - (f[r] + r * r)) / (2.0 * (q - r));
+        if (s > z[k]) {
+          break;
         }
-        offsets[offset_count][0] = dx;
-        offsets[offset_count][1] = dy;
-        offsets[offset_count][2] = dz;
-        ++offset_count;
+        --k;
+        if (k < 0) {
+          s = -inf;
+          break;
+        }
+      }
+
+      ++k;
+      v[k] = q;
+      z[k] = s;
+      z[k + 1] = inf;
+    }
+
+    k = 0;
+    for (int q = 0; q < n; ++q) {
+      while (z[k + 1] < q) {
+        ++k;
+      }
+      const int r = v[k];
+      d[q] = (q - r) * (q - r) + f[r];
+    }
+  };
+
+  std::vector<double> f(std::max({out_grid.X, out_grid.Y, out_grid.Z}));
+  std::vector<double> d(f.size());
+
+  for (int y = 0; y < out_grid.Y; ++y) {
+    for (int z = 0; z < out_grid.Z; ++z) {
+      for (int x = 0; x < out_grid.X; ++x) {
+        f[x] = distances[flatIndex(x, y, z)];
+      }
+      transformLine(f, d, out_grid.X);
+      for (int x = 0; x < out_grid.X; ++x) {
+        distances[flatIndex(x, y, z)] = d[x];
       }
     }
   }
 
-  while (!queue.empty()) {
-    auto [distance, position] = queue.top();
-    queue.pop();
-
-    const int x = std::get<0>(position);
-    const int y = std::get<1>(position);
-    const int z = std::get<2>(position);
-    const int idx = flatIndex(x, y, z);
-    if (distance > distances[idx]) {
-      continue;
-    }
-
-    for (int i = 0; i < offset_count; ++i) {
-      const int nx = x + offsets[i][0];
-      const int ny = y + offsets[i][1];
-      const int nz = z + offsets[i][2];
-      if (nx < 0 || nx >= out_grid.X || ny < 0 || ny >= out_grid.Y || nz < 0 || nz >= out_grid.Z) {
-        continue;
+  for (int x = 0; x < out_grid.X; ++x) {
+    for (int z = 0; z < out_grid.Z; ++z) {
+      for (int y = 0; y < out_grid.Y; ++y) {
+        f[y] = distances[flatIndex(x, y, z)];
       }
+      transformLine(f, d, out_grid.Y);
+      for (int y = 0; y < out_grid.Y; ++y) {
+        distances[flatIndex(x, y, z)] = d[y];
+      }
+    }
+  }
 
-      const double step = std::sqrt(offsets[i][0] * offsets[i][0] +
-                                    offsets[i][1] * offsets[i][1] +
-                                    offsets[i][2] * offsets[i][2]);
-      const double new_distance = distance + step;
-      const int neighbor_idx = flatIndex(nx, ny, nz);
-      if (new_distance < distances[neighbor_idx]) {
-        distances[neighbor_idx] = new_distance;
-        queue.push({new_distance, {nx, ny, nz}});
+  for (int x = 0; x < out_grid.X; ++x) {
+    for (int y = 0; y < out_grid.Y; ++y) {
+      for (int z = 0; z < out_grid.Z; ++z) {
+        f[z] = distances[flatIndex(x, y, z)];
+      }
+      transformLine(f, d, out_grid.Z);
+      for (int z = 0; z < out_grid.Z; ++z) {
+        distances[flatIndex(x, y, z)] = d[z];
       }
     }
   }
 
   for (size_t i = 0; i < out_grid.data.size(); ++i) {
-    out_grid.data[i] = static_cast<int>(std::floor(distances[i]));
+    out_grid.data[i] = static_cast<int>(std::floor(std::sqrt(distances[i])));
   }
 }  // //}
 
@@ -636,20 +709,36 @@ RBLReplanner::AStarPlan(const std::tuple<int,
 
   std::priority_queue<Node*, std::vector<Node*>, CompareNode> open_list;
   VoxelGrid                                                   closed_voxels(_X_, _Y_, _Z_);
+  std::vector<double>                                         best_g_score(grid->data.size(), std::numeric_limits<double>::infinity());
+  const auto flatIndex = [&grid](const std::tuple<int, int, int>& position) {
+    return std::get<0>(position) * grid->Y * grid->Z + std::get<1>(position) * grid->Z + std::get<2>(position);
+  };
 
+  best_g_score[flatIndex(start_node->position)] = 0.0;
   open_list.push(start_node);
   std::vector<Node*> all_allocated_nodes;
   all_allocated_nodes.push_back(start_node);
   all_allocated_nodes.push_back(end_node);
 
+  size_t expanded_nodes     = 0;
+  size_t generated_nodes    = 0;
+  size_t skipped_oob        = 0;
+  size_t skipped_occupied   = 0;
+  size_t skipped_closed     = 0;
+  size_t skipped_not_better = 0;
+  size_t stale_open_entries = 0;
+  size_t max_open_size      = open_list.size();
+
   while (!open_list.empty()) {
     Node* current_node = open_list.top();
     open_list.pop();
     if (closed_voxels.at(current_node->position)) {
+      ++stale_open_entries;
       continue;
     }
 
     closed_voxels.at(current_node->position) = 1;
+    ++expanded_nodes;
 
     if (*current_node == *end_node) {  // reconstruct the path
       // std::cout << "[RBLReplanner]: Reconstructing path." << std::endl;
@@ -674,10 +763,17 @@ RBLReplanner::AStarPlan(const std::tuple<int,
 
       for (Node* node : all_allocated_nodes)
         delete node;
-      // std::cout << "[RBLReplanner]: Path found returning path of this size: " << _path.size() << std::endl;
+      std::cout << "[RBLReplanner][astar] found path=" << _path.size()
+                << ", expanded=" << expanded_nodes
+                << ", generated=" << generated_nodes
+                << ", skipped_oob=" << skipped_oob
+                << ", skipped_occupied=" << skipped_occupied
+                << ", skipped_closed=" << skipped_closed
+                << ", skipped_not_better=" << skipped_not_better
+                << ", stale_open=" << stale_open_entries
+                << ", max_open=" << max_open_size << std::endl;
       return _path;
     }
-    std::vector<Node*> children;
     int                new_positions[][3] = { { 0, -1, 0 },   { 0, 1, 0 },   { -1, 0, 0 },  { 1, 0, 0 },
                                               { 0, 0, -1 },   { 0, 0, 1 },                                 // Face
                                               { -1, -1, 0 },  { -1, 1, 0 },  { 1, -1, 0 },  { 1, 1, 0 },   // Edge XY
@@ -695,40 +791,58 @@ RBLReplanner::AStarPlan(const std::tuple<int,
           std::get<0>(node_position) < 0 ||  // check if outside of local map where mapping and planning is happening
           std::get<1>(node_position) > grid->Y - 1 || std::get<1>(node_position) < 0 ||
           std::get<2>(node_position) > grid->Z - 1 || std::get<2>(node_position) < 0) {
+        ++skipped_oob;
         continue;
       }
 
       if (grid->at(std::get<0>(node_position), std::get<1>(node_position), std::get<2>(node_position)) !=
           0) {  // check if free space
+        ++skipped_occupied;
         continue;
       }
 
-      Node* new_node = new Node(current_node, node_position);
-      all_allocated_nodes.push_back(new_node);
-      children.push_back(new_node);
-    }
-
-    for (Node* child : children) {
-      if (closed_voxels.at(child->position))
+      if (closed_voxels.at(node_position)) {
+        ++skipped_closed;
         continue;
+      }
 
-      double dist_parent_child = euclideanDistance(current_node->position, child->position);
-      double clearance         = params_.replanner_vox_size * clearance_grid->at(child->position);
+      const double dist_parent_child = euclideanDistance(current_node->position, node_position);
+      const double clearance         = params_.replanner_vox_size * clearance_grid->at(node_position);
       double safety_penalty    = params_.weight_safety / (clearance + params_.eps);
       double deviation_penalty =
-          params_.weight_deviation * deviationPenalty(_path, current_node->position, child->position);
-      child->g = current_node->g + dist_parent_child + safety_penalty + deviation_penalty;
+          params_.weight_deviation * deviationPenalty(_path, current_node->position, node_position);
+      const double tentative_g = current_node->g + dist_parent_child + safety_penalty + deviation_penalty;
+      const int    child_idx   = flatIndex(node_position);
+      if (tentative_g + 1e-9 >= best_g_score[child_idx]) {
+        ++skipped_not_better;
+        continue;
+      }
+
+      best_g_score[child_idx] = tentative_g;
+
+      Node* child = new Node(current_node, node_position);
+      all_allocated_nodes.push_back(child);
+      ++generated_nodes;
+      child->g = tentative_g;
       child->h = euclideanDistance(child->position, end_node->position);
       child->f = child->g + child->h;
 
       open_list.push(child);
+      max_open_size = std::max(max_open_size, open_list.size());
     }
   }
 
   for (Node* node : all_allocated_nodes)
     delete node;
 
-  std::cout << "[RBLReplanner]: No path found" << std::endl;
+  std::cout << "[RBLReplanner]: No path found. expanded=" << expanded_nodes
+            << ", generated=" << generated_nodes
+            << ", skipped_oob=" << skipped_oob
+            << ", skipped_occupied=" << skipped_occupied
+            << ", skipped_closed=" << skipped_closed
+            << ", skipped_not_better=" << skipped_not_better
+            << ", stale_open=" << stale_open_entries
+            << ", max_open=" << max_open_size << std::endl;
 
   return {};
 }  // //}

@@ -65,6 +65,7 @@
 struct RBLParams {
   double                                step_size;
   double                                radius;
+  double                                path_lookahead_distance        = 0.0;
   double                                encumbrance;
   double                                dt;
   double                                beta_min;

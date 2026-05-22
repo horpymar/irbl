@@ -38,6 +38,8 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <std_srvs/srv/trigger.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
+#include <std_msgs/msg/string.hpp>
 
 #include <optional>
 
@@ -91,6 +93,9 @@ private:
 
   bool         is_initialized_ = false;
   bool         is_activated_   = false;
+  bool         benchmark_goal_active_ = false;
+  bool         benchmark_goal_reached_published_ = false;
+  Eigen::Vector3d benchmark_goal_ = Eigen::Vector3d::Zero();
 
   bool        _group_odoms_enabled_ = false;
   bool        _add_agents_to_pcl_   = false;
@@ -147,6 +152,8 @@ private:
   mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2> pub_viz_inflated_map_;
   mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2> pub_viz_cloud;
   mrs_lib::PublisherHandler<nav_msgs::msg::Path> pub_viz_path_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_benchmark_event_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_benchmark_goal_;
   
   std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>> cloud_proc_;
   std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>> cloud_raw_;
@@ -254,6 +261,7 @@ void WrapperRosRBL::initialize()  // //{
   param_loader.loadParam("rbl_controller/d6", rbl_params_.d6);
   param_loader.loadParam("rbl_controller/d7", rbl_params_.d7);
   param_loader.loadParam("rbl_controller/radius", rbl_params_.radius);
+  param_loader.loadParam("rbl_controller/path_lookahead_distance", rbl_params_.path_lookahead_distance);
   param_loader.loadParam("rbl_controller/encumbrance", rbl_params_.encumbrance);
   param_loader.loadParam("rbl_controller/step_size", rbl_params_.step_size);
   param_loader.loadParam("rbl_controller/betaD", rbl_params_.betaD);
@@ -355,6 +363,8 @@ void WrapperRosRBL::initialize()  // //{
   pub_viz_inflated_map_  = mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2>(node_, "~/inflated_map");
   pub_viz_cloud          = mrs_lib::PublisherHandler<sensor_msgs::msg::PointCloud2>(node_, "~/cloud");
   pub_viz_path_          = mrs_lib::PublisherHandler<nav_msgs::msg::Path>(node_, "~/path");
+  pub_benchmark_event_   = node_->create_publisher<std_msgs::msg::String>("/benchmark/event", rclcpp::SystemDefaultsQoS());
+  pub_benchmark_goal_    = node_->create_publisher<std_msgs::msg::Float64MultiArray>("/benchmark/goal", rclcpp::SystemDefaultsQoS());
   
   transformer_ = std::make_shared<mrs_lib::Transformer>(node_);
   transformer_->retryLookupNewest(true);
@@ -752,6 +762,16 @@ void WrapperRosRBL::cbTmDiagnostics()  // //{
   pub_viz_centroid_.publish(getVizCentroid(centroid, _frame_));
   pub_viz_seed_B_.publish(getVizCentroid(seed_b, _frame_));
 
+  if (benchmark_goal_active_ && !benchmark_goal_reached_published_ &&
+      (current_position - benchmark_goal_).norm() <= 0.3) {
+    std_msgs::msg::String event_msg;
+    event_msg.data = "goal_reached";
+    pub_benchmark_event_->publish(event_msg);
+    benchmark_goal_reached_published_ = true;
+    benchmark_goal_active_ = false;
+    RCLCPP_INFO(node_->get_logger(), "Benchmark event: goal_reached");
+  }
+
   // auto cell_S = getVizCellA(cell_s_points, _frame_);
   // if (cell_S) {
   //   pub_viz_cell_S_.publish(*cell_S);
@@ -842,10 +862,23 @@ bool WrapperRosRBL::cbSrvGotoPosition(const std::shared_ptr<mrs_msgs::srv::Vec4:
 {
   {
     std::scoped_lock lck(mtx_rbl_);
-    rbl_controller_->setGoal(Eigen::Vector3d{ req->goal[0], req->goal[1], req->goal[2] });
+    benchmark_goal_ = Eigen::Vector3d{ req->goal[0], req->goal[1], req->goal[2] };
+    benchmark_goal_active_ = true;
+    benchmark_goal_reached_published_ = false;
+    rbl_controller_->setGoal(benchmark_goal_);
     RCLCPP_INFO(node_->get_logger(), "RBL goal set to [%.3f, %.3f, %.3f], heading %.3f",
                 req->goal[0], req->goal[1], req->goal[2], req->goal[3]);
   }
+
+  std_msgs::msg::Float64MultiArray goal_msg;
+  goal_msg.data = { req->goal[0], req->goal[1], req->goal[2], req->goal[3] };
+  pub_benchmark_goal_->publish(goal_msg);
+
+  std_msgs::msg::String event_msg;
+  event_msg.data = "goal_set";
+  pub_benchmark_event_->publish(event_msg);
+  RCLCPP_INFO(node_->get_logger(), "Benchmark event: goal_set");
+
   res->success = true;
   res->message = "Goal set";
   RCLCPP_INFO(node_->get_logger(), "%s", res->message.c_str());
