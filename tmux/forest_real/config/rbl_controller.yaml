@@ -45,7 +45,7 @@ rbl_controller:
   cwvd_rob: 0.5
   use_map: true
   use_garmin_alt: false
-  replanner: false
+  replanner: true # whether to use the replanner or not
   boundary_threshold_speed: 0.01
   move_centroid_to_sensed_cell: false
   octomap:

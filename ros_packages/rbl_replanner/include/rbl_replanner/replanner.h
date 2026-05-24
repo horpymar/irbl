@@ -10,7 +10,7 @@
 #include <iostream>
 #include <cmath>
 #include <limits>
-#include <numeric> 
+#include <numeric>
 #include <tuple>
 #include <vector>
 #include <optional>
@@ -88,7 +88,22 @@ struct ReplannerParams {
   double                                                    replanner_freq;
   double                                                    eps                   = 0.001;
   double                                                    inflation_bonus       = 0.1;
-  double                                                    replanner_vox_size    = 0.1; 
+  double                                                    replanner_vox_size    = 0.1;
+  // A*/RBL consensus: planner keeps RBL's reliable control region and safety model in its costs.
+  double                                                    rbl_radius            = 0.0;
+  double                                                    rbl_lookahead         = 0.0;
+  double                                                    ciri_inflation        = 0.0;
+  double                                                    heading_weight        = 0.0;
+  double                                                    outside_rbl_weight    = 5.0;
+  double                                                    min_clearance         = 0.0;
+  // A*/RBL altitude consensus: planner must not request references above the controller's safe ceiling.
+  double                                                    max_flight_z          = std::numeric_limits<double>::infinity();
+};
+
+struct ReplannerVirtualObstacle {
+  Eigen::Vector3d center = Eigen::Vector3d::Zero();
+  double          radius = 0.0;
+  double          weight = 0.0;
 };
 
 class RBLReplanner {
@@ -98,6 +113,7 @@ public:
   void setGoal(const Eigen::Vector3d& point);
   void setAltitude(const double& alt);
   void setPCL(const std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>>& cloud);
+  void setVirtualObstacles(const std::vector<ReplannerVirtualObstacle>& obstacles);
 
   std::vector<Eigen::Vector3d> getInflatedCloud();
 
@@ -116,6 +132,7 @@ private:
   std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>>           cloud_;
   std::vector<Eigen::Vector3d>                              path_;
   std::vector<Eigen::Vector3d>                              smooth_path_;
+  std::vector<ReplannerVirtualObstacle>                     virtual_obstacles_;
   std::chrono::high_resolution_clock::time_point            last_replan;
   bool                                                      first_plan;
   bool                                                      goal_changed_;
@@ -134,20 +151,23 @@ private:
   bool pathBlocked(std::vector<std::tuple<int, int, int>> _path, std::optional<VoxelGrid>& grid);
 
   void initializationPlan();
+  std::tuple<int, int, int> localSubgoalOnMapBoundary(const std::tuple<int, int, int>& start,
+                                                      const std::tuple<int, int, int>& goal) const;
   double roundToNextMultiple(double value, double multiple);
   Eigen::Vector3d gridIdxToWorldCoords(const std::tuple<int, int, int>& _point);
   Eigen::Vector3d gridIdxToWorldCoords(const int& x, const int& y, const int& z);
   std::tuple<int, int, int> worldCoordsToGridIdx(const Eigen::Vector3d& point);
   std::tuple<int, int, int> worldCoordsToGridIdx(const pcl::PointXYZI& point);
   void fillAndInflateGrid(std::optional<VoxelGrid>& grid, const std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>>& cloud);
-  void calculateClearanceGrid(std::optional<VoxelGrid>& clearance_grid, const std::optional<VoxelGrid>& input_grid);
-  void calculate1dSquaredDistance(std::vector<int>& data, int length, int stride);
+  void calculateClearanceGrid(std::optional<VoxelGrid>& clearance, const std::optional<VoxelGrid>& input);
+  void calculate1dSquaredDistance(int* f, int* d, int n);
   std::vector<Eigen::Vector3d> gridPathToWorldPath(std::vector<std::tuple<int, int ,int>>& _path);
   std::vector<std::tuple<int, int, int>> worldPathToGridPath(const std::vector<Eigen::Vector3d>& path);
   std::vector<std::tuple<int, int, int>> smoothPath(const std::vector<std::tuple<int, int ,int>>& _path, const std::optional<VoxelGrid>& grid, const std::optional<VoxelGrid>* clearance_grid = nullptr);
   bool canConnectPoints(const std::tuple<int, int, int>& p1, const std::tuple<int, int, int>& p2, const std::optional<VoxelGrid>& grid, const std::optional<VoxelGrid>* clearance_grid = nullptr);
   std::vector<std::tuple<int, int ,int>> AStarPlan(const std::tuple<int, int, int> _start, const std::tuple<int, int, int> _goal, const std::vector<std::tuple<int, int, int>>& _path, const std::optional<VoxelGrid>& grid, const std::optional<VoxelGrid>& clearance_grid);
   double deviationPenalty(const std::vector<std::tuple<int, int, int>>& _path, const std::tuple<int, int, int>& _p1, const std::tuple<int, int, int>& _p2);
+  double virtualObstaclePenalty(const Eigen::Vector3d& point) const;
   double euclideanDistance(const std::tuple<int, int, int>& p1, const std::tuple<int, int, int>& p2);
   std::tuple<int, int, int> closestFreeIdx(const std::tuple<int, int, int>& _position, const std::optional<VoxelGrid>& grid);
 };

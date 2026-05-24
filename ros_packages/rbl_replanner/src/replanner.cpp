@@ -6,7 +6,8 @@ RBLReplanner::RBLReplanner(const ReplannerParams& params) : params_(params)  // 
   voxel_size_ = roundToNextMultiple(params.voxel_size, params.replanner_vox_size);
   inflation_  = roundToNextMultiple(params.encumbrance + params.inflation_bonus, params.replanner_vox_size);
   // std::cout << "[RBLReplanner]: voxel_size_: " << voxel_size_ << ", inflation_: " << inflation_ << std::endl;
-  inflation_coeff_ = std::ceil((inflation_) / params.replanner_vox_size) - 1;
+  // A*/RBL consensus: keep A* hard inflation at least as conservative as the controller safety radius.
+  inflation_coeff_ = std::ceil(inflation_ / params.replanner_vox_size);
   std::cout << "Inflation coef: " << inflation_coeff_ << std::endl;
   //   int inflation_coeff = std::ceil(encumbrance / map_resolution);
 
@@ -50,6 +51,29 @@ void RBLReplanner::setAltitude(const double& alt)  // //{
 void RBLReplanner::setPCL(const std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>>& cloud)  // //{
 {
   cloud_ = cloud;
+}  // //}
+
+void RBLReplanner::setVirtualObstacles(const std::vector<ReplannerVirtualObstacle>& obstacles)  // //{
+{
+  // Recovery/stuck detection: virtual obstacles are a soft memory of repeated local minima.
+  // They are not written into the occupancy grid, so they can expire without corrupting the map.
+  const bool obstacle_count_changed = virtual_obstacles_.size() != obstacles.size();
+  bool obstacle_values_changed = obstacle_count_changed;
+  if (!obstacle_values_changed) {
+    for (std::size_t i = 0; i < obstacles.size(); ++i) {
+      if (!virtual_obstacles_[i].center.isApprox(obstacles[i].center, 1e-6) ||
+          std::abs(virtual_obstacles_[i].radius - obstacles[i].radius) > 1e-6 ||
+          std::abs(virtual_obstacles_[i].weight - obstacles[i].weight) > 1e-6) {
+        obstacle_values_changed = true;
+        break;
+      }
+    }
+  }
+
+  virtual_obstacles_ = obstacles;
+  if (obstacle_values_changed) {
+    goal_changed_ = true;
+  }
 }  // //}
 
 std::vector<Eigen::Vector3d> RBLReplanner::getInflatedCloud()  // //{
@@ -275,11 +299,77 @@ void RBLReplanner::initializationPlan()  // //{
   _clearance_grid_->clear();
   _agent_pos_ =
       std::make_tuple(_X_ / 2, _Y_ / 2, std::max(static_cast<int>(altitude_ / params_.replanner_vox_size), 0));
-  auto _point = worldCoordsToGridIdx(goal_);
-  int  x_goal = std::clamp(std::get<0>(_point), 0, _X_ - 1);
-  int  y_goal = std::clamp(std::get<1>(_point), 0, _Y_ - 1);
-  int  z_goal = std::clamp(std::get<2>(_point), 0, _Z_ - 1);
-  _goal_      = std::make_tuple(x_goal, y_goal, z_goal);
+  _goal_ = localSubgoalOnMapBoundary(_agent_pos_, worldCoordsToGridIdx(goal_));
+}  // //}
+
+// A*/RBL consensus: preserve goal direction and cap the local target by the reliable RBL radius.
+std::tuple<int, int, int> RBLReplanner::localSubgoalOnMapBoundary(const std::tuple<int, int, int>& start,
+                                                                  const std::tuple<int, int, int>& goal) const  // //{
+{
+  const int min_bounds[3] = {0, 0, 0};
+  const int s[3] = {std::get<0>(start), std::get<1>(start), std::get<2>(start)};
+  const int g[3] = {std::get<0>(goal), std::get<1>(goal), std::get<2>(goal)};
+  int       max_bounds[3] = {_X_ - 1, _Y_ - 1, _Z_ - 1};
+
+  if (std::isfinite(params_.max_flight_z)) {
+    const int max_flight_z_idx =
+        static_cast<int>(std::floor((params_.max_flight_z - agent_pos_.z()) / params_.replanner_vox_size)) + s[2];
+    // A*/RBL altitude consensus: cap the local target by the safe controller altitude ceiling.
+    max_bounds[2] = std::clamp(std::max(s[2], max_flight_z_idx), min_bounds[2], max_bounds[2]);
+  }
+
+  bool goal_inside = true;
+  for (int axis = 0; axis < 3; ++axis) {
+    if (g[axis] < min_bounds[axis] || g[axis] > max_bounds[axis]) {
+      goal_inside = false;
+      break;
+    }
+  }
+
+  const double direction_x = static_cast<double>(g[0] - s[0]);
+  const double direction_y = static_cast<double>(g[1] - s[1]);
+  const double direction_z = static_cast<double>(g[2] - s[2]);
+  const double distance_cells =
+      std::sqrt(direction_x * direction_x + direction_y * direction_y + direction_z * direction_z);
+
+  if (distance_cells <= 1e-9) {
+    return goal;
+  }
+
+  double t_exit = std::numeric_limits<double>::infinity();
+  for (int axis = 0; axis < 3; ++axis) {
+    const int direction = g[axis] - s[axis];
+    if (direction > 0) {
+      t_exit = std::min(t_exit, static_cast<double>(max_bounds[axis] - s[axis]) / static_cast<double>(direction));
+    }
+    else if (direction < 0) {
+      t_exit = std::min(t_exit, static_cast<double>(min_bounds[axis] - s[axis]) / static_cast<double>(direction));
+    }
+  }
+
+  // A*/RBL consensus: do not commit the local A* target beyond the controller's reliable region.
+  const double effective_radius_cells =
+      params_.rbl_radius > 0.0 ? params_.rbl_radius / params_.replanner_vox_size : std::numeric_limits<double>::infinity();
+  const double t_radius = effective_radius_cells / distance_cells;
+  const double t_goal   = goal_inside ? 1.0 : std::numeric_limits<double>::infinity();
+  double       t_subgoal = std::min({t_exit, t_radius, t_goal});
+
+  if (!std::isfinite(t_exit)) {
+    return std::make_tuple(std::clamp(g[0], min_bounds[0], max_bounds[0]),
+                           std::clamp(g[1], min_bounds[1], max_bounds[1]),
+                           std::clamp(g[2], min_bounds[2], max_bounds[2]));
+  }
+
+  if (!std::isfinite(t_subgoal)) {
+    t_subgoal = t_exit;
+  }
+
+  const auto projectAxis = [&](const int axis) {
+    const double projected = static_cast<double>(s[axis]) + t_subgoal * static_cast<double>(g[axis] - s[axis]);
+    return std::clamp(static_cast<int>(std::round(projected)), min_bounds[axis], max_bounds[axis]);
+  };
+
+  return std::make_tuple(projectAxis(0), projectAxis(1), projectAxis(2));
 }  // //}
 
 double RBLReplanner::roundToNextMultiple(double value,
@@ -346,31 +436,39 @@ RBLReplanner::worldCoordsToGridIdx(const pcl::PointXYZI& point)  // //{
 void RBLReplanner::fillAndInflateGrid(std::optional<VoxelGrid>&                              grid,
                                       const std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>>& cloud)  // //{
 {
-  int                           x, y, z;
-  std::vector<std::vector<int>> idx_to_inflate;
+  if (!grid.has_value() || !cloud) {
+    return;
+  }
+
+  std::vector<std::tuple<int, int, int>> occupied;
   for (const auto& point : cloud->points) {
     auto _point = worldCoordsToGridIdx(point);
-    x           = std::get<0>(_point);
-    y           = std::get<1>(_point);
-    z           = std::get<2>(_point);
-    if (x > 0 && x < grid->X && y > 0 && y < grid->Y && z > 0 && z < grid->Z) {
+    const int x = std::get<0>(_point);
+    const int y = std::get<1>(_point);
+    const int z = std::get<2>(_point);
+
+    if (x >= 0 && x < grid->X && y >= 0 && y < grid->Y && z >= 0 && z < grid->Z) {
       grid->at(x, y, z) = 1;
-      idx_to_inflate.push_back({ x, y, z });
-    }
-    else {
-      // std::cout << "Error indexing the grid" << std::endl; // TODO THINK about it because it misses a lot - its + 1
-      // somewhere ._.
+      occupied.push_back(_point);
     }
   }
 
-  for (const auto& idx : idx_to_inflate) {
-    x = idx[0];
-    y = idx[1];
-    z = idx[2];
-    for (int dx = -inflation_coeff_; dx <= inflation_coeff_; dx++) {
-      for (int dy = -inflation_coeff_; dy <= inflation_coeff_; dy++) {
-        for (int dz = -inflation_coeff_; dz <= inflation_coeff_; dz++) {
-          int nx = x + dx, ny = y + dy, nz = z + dz;
+  const int inflation_radius_sq = inflation_coeff_ * inflation_coeff_;
+  for (const auto& idx : occupied) {
+    const int x = std::get<0>(idx);
+    const int y = std::get<1>(idx);
+    const int z = std::get<2>(idx);
+
+    for (int dx = -inflation_coeff_; dx <= inflation_coeff_; ++dx) {
+      for (int dy = -inflation_coeff_; dy <= inflation_coeff_; ++dy) {
+        for (int dz = -inflation_coeff_; dz <= inflation_coeff_; ++dz) {
+          if (dx * dx + dy * dy + dz * dz > inflation_radius_sq) {
+            continue;
+          }
+
+          const int nx = x + dx;
+          const int ny = y + dy;
+          const int nz = z + dz;
           if (nx >= 0 && nx < grid->X && ny >= 0 && ny < grid->Y && nz >= 0 && nz < grid->Z) {
             grid->at(nx, ny, nz) = 1;
           }
@@ -386,162 +484,114 @@ void RBLReplanner::fillAndInflateGrid(std::optional<VoxelGrid>&                 
   }
 }  // //}
 
-// Felzenszwalb & Huttenlocher (F&H) algorithm
-void RBLReplanner::calculateClearanceGrid(std::optional<VoxelGrid>&       clearance_grid,
-                                          const std::optional<VoxelGrid>& input_grid)  // //{
+// Felzenszwalb & Huttenlocher distance transform, applied line-by-line.
+void RBLReplanner::calculateClearanceGrid(std::optional<VoxelGrid>& clearance,
+                                          const std::optional<VoxelGrid>& input)
 {
-  if (!input_grid.has_value() || !clearance_grid.has_value()) {
+  if (!input.has_value() || !clearance.has_value()) {
     return;
   }
 
-  const VoxelGrid& in_grid  = *input_grid;
-  VoxelGrid&       out_grid = *clearance_grid;
+  const int INF = 1e9;
 
-  const auto flatIndex = [&out_grid](const int x, const int y, const int z) {
-    return x * out_grid.Y * out_grid.Z + y * out_grid.Z + z;
-  };
-
-  const double inf = 1e12;
-  std::vector<double> distances(out_grid.data.size(), inf);
-  bool has_occupied = false;
-
-  for (int x = 0; x < in_grid.X; ++x) {
-    for (int y = 0; y < in_grid.Y; ++y) {
-      for (int z = 0; z < in_grid.Z; ++z) {
-        if (in_grid.at(x, y, z) != 0) {
-          distances[flatIndex(x, y, z)] = 0.0;
-          has_occupied = true;
-        }
+  for (int x = 0; x < _X_; ++x) {
+    for (int y = 0; y < _Y_; ++y) {
+      for (int z = 0; z < _Z_; ++z) {
+        clearance->at(x, y, z) = input->at(x, y, z) ? 0 : INF;
       }
     }
   }
 
-  if (!has_occupied) {
-    std::fill(out_grid.data.begin(), out_grid.data.end(), std::max({out_grid.X, out_grid.Y, out_grid.Z}));
+  std::vector<int> f;
+  std::vector<int> d;
+
+  f.resize(_X_);
+  d.resize(_X_);
+  for (int y = 0; y < _Y_; ++y) {
+    for (int z = 0; z < _Z_; ++z) {
+      for (int x = 0; x < _X_; ++x) {
+        f[x] = clearance->at(x, y, z);
+      }
+      calculate1dSquaredDistance(f.data(), d.data(), _X_);
+      for (int x = 0; x < _X_; ++x) {
+        clearance->at(x, y, z) = d[x];
+      }
+    }
+  }
+
+  f.resize(_Y_);
+  d.resize(_Y_);
+  for (int x = 0; x < _X_; ++x) {
+    for (int z = 0; z < _Z_; ++z) {
+      for (int y = 0; y < _Y_; ++y) {
+        f[y] = clearance->at(x, y, z);
+      }
+      calculate1dSquaredDistance(f.data(), d.data(), _Y_);
+      for (int y = 0; y < _Y_; ++y) {
+        clearance->at(x, y, z) = d[y];
+      }
+    }
+  }
+
+  f.resize(_Z_);
+  d.resize(_Z_);
+  for (int x = 0; x < _X_; ++x) {
+    for (int y = 0; y < _Y_; ++y) {
+      for (int z = 0; z < _Z_; ++z) {
+        f[z] = clearance->at(x, y, z);
+      }
+      calculate1dSquaredDistance(f.data(), d.data(), _Z_);
+      for (int z = 0; z < _Z_; ++z) {
+        clearance->at(x, y, z) = static_cast<int>(std::floor(std::sqrt(d[z])));
+      }
+    }
+  }
+}
+
+void RBLReplanner::calculate1dSquaredDistance(int* f, int* d, int n)
+{
+  if (n <= 0) {
     return;
   }
 
-  const auto transformLine = [inf](const std::vector<double>& f, std::vector<double>& d, const int n) {
-    std::vector<int>    v(n);
-    std::vector<double> z(n + 1);
+  std::vector<int> v(n);
+  std::vector<double> z(n + 1);
 
-    int k = 0;
-    v[0] = 0;
-    z[0] = -inf;
-    z[1] = inf;
-
-    for (int q = 1; q < n; ++q) {
-      double s = 0.0;
-      while (true) {
-        const int r = v[k];
-        s = ((f[q] + q * q) - (f[r] + r * r)) / (2.0 * (q - r));
-        if (s > z[k]) {
-          break;
-        }
-        --k;
-        if (k < 0) {
-          s = -inf;
-          break;
-        }
-      }
-
-      ++k;
-      v[k] = q;
-      z[k] = s;
-      z[k + 1] = inf;
-    }
-
-    k = 0;
-    for (int q = 0; q < n; ++q) {
-      while (z[k + 1] < q) {
-        ++k;
-      }
-      const int r = v[k];
-      d[q] = (q - r) * (q - r) + f[r];
-    }
-  };
-
-  std::vector<double> f(std::max({out_grid.X, out_grid.Y, out_grid.Z}));
-  std::vector<double> d(f.size());
-
-  for (int y = 0; y < out_grid.Y; ++y) {
-    for (int z = 0; z < out_grid.Z; ++z) {
-      for (int x = 0; x < out_grid.X; ++x) {
-        f[x] = distances[flatIndex(x, y, z)];
-      }
-      transformLine(f, d, out_grid.X);
-      for (int x = 0; x < out_grid.X; ++x) {
-        distances[flatIndex(x, y, z)] = d[x];
-      }
-    }
-  }
-
-  for (int x = 0; x < out_grid.X; ++x) {
-    for (int z = 0; z < out_grid.Z; ++z) {
-      for (int y = 0; y < out_grid.Y; ++y) {
-        f[y] = distances[flatIndex(x, y, z)];
-      }
-      transformLine(f, d, out_grid.Y);
-      for (int y = 0; y < out_grid.Y; ++y) {
-        distances[flatIndex(x, y, z)] = d[y];
-      }
-    }
-  }
-
-  for (int x = 0; x < out_grid.X; ++x) {
-    for (int y = 0; y < out_grid.Y; ++y) {
-      for (int z = 0; z < out_grid.Z; ++z) {
-        f[z] = distances[flatIndex(x, y, z)];
-      }
-      transformLine(f, d, out_grid.Z);
-      for (int z = 0; z < out_grid.Z; ++z) {
-        distances[flatIndex(x, y, z)] = d[z];
-      }
-    }
-  }
-
-  for (size_t i = 0; i < out_grid.data.size(); ++i) {
-    out_grid.data[i] = static_cast<int>(std::floor(std::sqrt(distances[i])));
-  }
-}  // //}
-
-void RBLReplanner::calculate1dSquaredDistance(std::vector<int>& data,
-                                              int               length,
-                                              int               stride)  // //{
-{
-  std::vector<int>    f(length);
-  std::vector<int>    v(length);
-  std::vector<double> z(length + 1);
-
-  // Pass 1: find lower envelope of parabolas
   int k = 0;
-  v[0]  = 0;
-  z[0]  = -std::numeric_limits<double>::infinity();
-  z[1]  = std::numeric_limits<double>::infinity();
+  v[0] = 0;
+  z[0] = -1e20;
+  z[1] = 1e20;
 
-  for (int q = 1; q < length; ++q) {
-    double s;
-    do {
-      int r = v[k];
-      // Intersection point of two parabolas
-      s = (double)((data[q * stride] + q * q) - (data[r * stride] + r * r)) / (2.0 * (q - r));
-    } while (s <= z[k--]);
-    k += 2;
-    v[k]     = q;
-    z[k]     = s;
-    z[k + 1] = std::numeric_limits<double>::infinity();
-  }
-
-  // Pass 2: compute final distances
-  k = 0;
-  for (int q = 0; q < length; ++q) {
-    while (z[k + 1] < q) {
-      k++;
+  for (int q = 1; q < n; ++q) {
+    double s = 0.0;
+    while (true) {
+      const int r = v[k];
+      s = ((f[q] + q * q) - (f[r] + r * r)) / (2.0 * (q - r));
+      if (s > z[k]) {
+        break;
+      }
+      --k;
+      if (k < 0) {
+        s = -1e20;
+        break;
+      }
     }
-    int r            = v[k];
-    data[q * stride] = data[r * stride] + (q - r) * (q - r);
+
+    ++k;
+    v[k] = q;
+    z[k] = s;
+    z[k + 1] = 1e20;
   }
-}  // //}
+
+  k = 0;
+  for (int q = 0; q < n; ++q) {
+    while (z[k + 1] < q) {
+      ++k;
+    }
+    const int r = v[k];
+    d[q] = (q - r) * (q - r) + f[r];
+  }
+}
 
 std::vector<Eigen::Vector3d> RBLReplanner::gridPathToWorldPath(std::vector<std::tuple<int,
                                                                                       int,
@@ -724,6 +774,8 @@ RBLReplanner::AStarPlan(const std::tuple<int,
   size_t generated_nodes    = 0;
   size_t skipped_oob        = 0;
   size_t skipped_occupied   = 0;
+  size_t skipped_clearance  = 0;
+  size_t skipped_altitude   = 0;
   size_t skipped_closed     = 0;
   size_t skipped_not_better = 0;
   size_t stale_open_entries = 0;
@@ -768,6 +820,8 @@ RBLReplanner::AStarPlan(const std::tuple<int,
                 << ", generated=" << generated_nodes
                 << ", skipped_oob=" << skipped_oob
                 << ", skipped_occupied=" << skipped_occupied
+                << ", skipped_clearance=" << skipped_clearance
+                << ", skipped_altitude=" << skipped_altitude
                 << ", skipped_closed=" << skipped_closed
                 << ", skipped_not_better=" << skipped_not_better
                 << ", stale_open=" << stale_open_entries
@@ -795,6 +849,16 @@ RBLReplanner::AStarPlan(const std::tuple<int,
         continue;
       }
 
+      if (std::isfinite(params_.max_flight_z)) {
+        const double node_z = (std::get<2>(node_position) - std::get<2>(_agent_pos_)) * params_.replanner_vox_size +
+                              agent_pos_.z();
+        // A*/RBL altitude consensus: never plan a waypoint above the safe controller ceiling.
+        if (node_z > params_.max_flight_z + 1e-9) {
+          ++skipped_altitude;
+          continue;
+        }
+      }
+
       if (grid->at(std::get<0>(node_position), std::get<1>(node_position), std::get<2>(node_position)) !=
           0) {  // check if free space
         ++skipped_occupied;
@@ -808,11 +872,23 @@ RBLReplanner::AStarPlan(const std::tuple<int,
 
       const double dist_parent_child = euclideanDistance(current_node->position, node_position);
       const double clearance         = params_.replanner_vox_size * clearance_grid->at(node_position);
-      double safety_penalty    = params_.weight_safety / (clearance + params_.eps);
+      // A*/RBL consensus: reject cells that are too close to the already-inflated occupancy boundary.
+      if (params_.min_clearance > 0.0 && clearance < params_.min_clearance) {
+        ++skipped_clearance;
+        continue;
+      }
+
+      double safety_penalty = params_.weight_safety / (clearance + params_.eps);
       double deviation_penalty =
           params_.weight_deviation * deviationPenalty(_path, current_node->position, node_position);
-      const double tentative_g = current_node->g + dist_parent_child + safety_penalty + deviation_penalty;
-      const int    child_idx   = flatIndex(node_position);
+      const double virtual_obstacle_penalty = virtualObstaclePenalty(gridIdxToWorldCoords(node_position));
+      // A*/RBL consensus: keep far-away nodes usable, but prefer the controller's reliable radius.
+      const double dist_from_agent = euclideanDistance(_start, node_position);
+      const double outside_rbl     = params_.rbl_radius > 0.0 ? std::max(0.0, dist_from_agent - params_.rbl_radius) : 0.0;
+      const double rbl_penalty     = params_.outside_rbl_weight * outside_rbl * outside_rbl;
+      const double tentative_g =
+          current_node->g + dist_parent_child + safety_penalty + deviation_penalty + rbl_penalty + virtual_obstacle_penalty;
+      const int    child_idx       = flatIndex(node_position);
       if (tentative_g + 1e-9 >= best_g_score[child_idx]) {
         ++skipped_not_better;
         continue;
@@ -839,6 +915,8 @@ RBLReplanner::AStarPlan(const std::tuple<int,
             << ", generated=" << generated_nodes
             << ", skipped_oob=" << skipped_oob
             << ", skipped_occupied=" << skipped_occupied
+            << ", skipped_clearance=" << skipped_clearance
+            << ", skipped_altitude=" << skipped_altitude
             << ", skipped_closed=" << skipped_closed
             << ", skipped_not_better=" << skipped_not_better
             << ", stale_open=" << stale_open_entries
@@ -867,6 +945,27 @@ double RBLReplanner::deviationPenalty(const std::vector<std::tuple<int,
     }
   }
   return 1.0;
+}  // //}
+
+double RBLReplanner::virtualObstaclePenalty(const Eigen::Vector3d& point) const  // //{
+{
+  double penalty = 0.0;
+  for (const auto& obstacle : virtual_obstacles_) {
+    if (obstacle.radius <= 1e-6 || obstacle.weight <= 0.0) {
+      continue;
+    }
+
+    const double distance = (point - obstacle.center).norm();
+    if (distance >= obstacle.radius) {
+      continue;
+    }
+
+    const double normalized = 1.0 - distance / obstacle.radius;
+    // Recovery/stuck detection: quadratic soft penalty keeps the area usable if it is the only exit,
+    // but makes A* prefer paths that do not re-enter a repeated stuck zone.
+    penalty += obstacle.weight * normalized * normalized;
+  }
+  return penalty;
 }  // //}
 
 double RBLReplanner::euclideanDistance(const std::tuple<int,

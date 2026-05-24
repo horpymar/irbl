@@ -176,6 +176,7 @@ private:
   std::vector<Eigen::Vector3d>                              inflated_map_;
   std::vector<Eigen::Vector3d>                              injected_points_map_;
   std::vector<Eigen::Vector3d>                              path_;
+  std::size_t                                               path_progress_index_ = 0;
   std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>>           cloud_;
   std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>>           cloud_obs_;
   std::shared_ptr<RBLReplanner>                             rbl_replanner_;
@@ -183,6 +184,47 @@ private:
   std::uint64_t                                             goal_generation_ = 0;
   std::future<std::tuple<std::uint64_t, std::vector<Eigen::Vector3d>, std::vector<Eigen::Vector3d>>> replanner_future_;
   std::mutex                                                replanner_mutex_;
+
+  // Recovery/stuck detection: controller-side state for escaping repeat local minima.
+  // The real user goal stays in goal_; during ESCAPE_BACKTRACK only active_recovery_goal_
+  // is sent to the replanner, then normal planning to goal_ resumes after cooldown.
+  enum class RecoveryMode {
+    NORMAL,
+    ESCAPE_BACKTRACK,
+    RECOVERY_COOLDOWN,
+  };
+
+  struct Breadcrumb {
+    Eigen::Vector3d position = Eigen::Vector3d::Zero();
+    std::chrono::steady_clock::time_point stamp;
+    std::uint64_t goal_generation = 0;
+  };
+
+  struct VirtualObstacleMemory {
+    Eigen::Vector3d center = Eigen::Vector3d::Zero();
+    double radius = 0.0;
+    double weight = 0.0;
+    int repeat_count = 0;
+    std::chrono::steady_clock::time_point expires_at;
+  };
+
+  RecoveryMode                                             recovery_mode_ = RecoveryMode::NORMAL;
+  std::deque<Breadcrumb>                                   breadcrumbs_;
+  std::vector<VirtualObstacleMemory>                       virtual_obstacles_;
+  Eigen::Vector3d                                          active_recovery_goal_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d                                          recovery_last_progress_pos_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d                                          recovery_last_stuck_pos_ = Eigen::Vector3d::Zero();
+  double                                                   recovery_best_goal_dist_ = std::numeric_limits<double>::infinity();
+  int                                                      recovery_repeat_stuck_count_ = 0;
+  bool                                                     recovery_has_progress_sample_ = false;
+  bool                                                     recovery_has_stuck_sample_ = false;
+  std::chrono::steady_clock::time_point                    recovery_goal_set_time_;
+  std::chrono::steady_clock::time_point                    recovery_last_progress_time_;
+  std::chrono::steady_clock::time_point                    recovery_escape_started_time_;
+  std::chrono::steady_clock::time_point                    recovery_cooldown_until_;
+  std::chrono::steady_clock::time_point                    path_last_accept_time_;
+  RecoveryMode                                             accepted_path_recovery_mode_ = RecoveryMode::NORMAL;
+  Eigen::Vector3d                                          accepted_path_goal_ = Eigen::Vector3d::Zero();
 
   std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>> getGroundCleanCloud(std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>>& cloud, const Eigen::Vector3d& agent_pos, const double& altitude);
 std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>> downSamplePcl(std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>>& cloud,  // //{
@@ -222,7 +264,23 @@ std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>> downSamplePcl(std::shared_ptr<p
                   const double& d1, const double& d2, const double& d3, const double& d4, const double& d5, const double& d6, const double& d7, const double& betaD, const double& beta_min, const double& dt);
   Eigen::Vector3d determineWaypoint(const std::vector<Eigen::Vector3d>& path, const Eigen::Vector3d& agent_pos, const Eigen::Vector3d& goal, Eigen::Vector3d& waypoint);
   Eigen::Vector3d determineWaypointFixedDistance(const std::vector<Eigen::Vector3d>& path, const Eigen::Vector3d& agent_pos, const Eigen::Vector3d& goal);
+  bool isWaypointSegmentClear(const Eigen::Vector3d& from, const Eigen::Vector3d& to) const;
+  bool shouldAcceptReplannerPath(const std::vector<Eigen::Vector3d>& new_path, const Eigen::Vector3d& planning_goal) const;
+  void acceptReplannerPath(std::vector<Eigen::Vector3d>&& new_path, std::vector<Eigen::Vector3d>&& new_inflated_map, const Eigen::Vector3d& planning_goal);
+  void clearReplannerPath();
   void determineNextRef(mrs_msgs::msg::Reference& p_ref, const Eigen::Vector3d& agent_pos, const Eigen::Vector3d& waypoint, const Eigen::Vector3d& goal, const Eigen::Vector3d& c1, const Eigen::Vector3d& c1_full, const Eigen::Vector3d& rpy, const std::vector<Eigen::Vector3d>& path);
+  mrs_msgs::msg::Reference recoveryFallbackRef() const;
+  void updateRecoveryState();
+  void resetRecoveryForNewGoal();
+  void appendRecoveryBreadcrumb(const std::chrono::steady_clock::time_point& now);
+  bool selectEscapeBreadcrumb(Eigen::Vector3d& escape_goal) const;
+  void enterRecoveryEscape(const std::chrono::steady_clock::time_point& now);
+  void addOrStrengthenVirtualObstacle(const Eigen::Vector3d& stuck_position, const std::chrono::steady_clock::time_point& now);
+  void addVirtualObstacleMemory(const Eigen::Vector3d& center, double radius, double weight, const std::chrono::steady_clock::time_point& now);
+  void addFailedPathVirtualObstacles(const Eigen::Vector3d& stuck_position, const Eigen::Vector3d& escape_goal, const std::chrono::steady_clock::time_point& now);
+  void pruneVirtualObstacles(const std::chrono::steady_clock::time_point& now);
+  std::vector<ReplannerVirtualObstacle> activeVirtualObstacles(const std::chrono::steady_clock::time_point& now) const;
+  Eigen::Vector3d activePlanningGoal() const;
   mrs_msgs::msg::Reference pRefAgent(const Eigen::Vector3d& agent_pos, const double yaw);
   double determineYaw(const Eigen::Vector3d& agent_pos, const Eigen::Vector3d& waypoint, const std::vector<Eigen::Vector3d>& path, const Eigen::Vector3d& rpy);
   // double determineYaw(const Eigen::Vector3d& agent_pos, const std::vector<Eigen::Vector3d>& path, const Eigen::Vector3d& rpy);

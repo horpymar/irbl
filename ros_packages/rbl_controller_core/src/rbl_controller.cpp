@@ -115,6 +115,13 @@ std::size_t appendNearAgentCell(std::vector<Eigen::Vector3d>&       cell,
 
 RBLController::RBLController(const RBLParams& params) : params_(params)  // //{
 {
+  const auto now = std::chrono::steady_clock::now();
+  recovery_goal_set_time_      = now;
+  recovery_last_progress_time_ = now;
+  recovery_escape_started_time_ = now;
+  recovery_cooldown_until_     = now;
+  path_last_accept_time_       = now;
+
   radius_sensing_ = params_.radius + params_.encumbrance + sqrt(3 * pow(params_.voxel_size / 2.0, 2));
   beta_           = params_.beta_min;
   if (params.replanner) {
@@ -128,6 +135,15 @@ RBLController::RBLController(const RBLParams& params) : params_(params)  // //{
     replanner_params.inflation_bonus    = params.inflation_bonus;
     replanner_params.replanner_vox_size = 0.3;
     replanner_params.replanner_freq     = 1.0;  //[Hz]
+    // A*/RBL consensus: pass the controller's reliable region and safety scale to the replanner.
+    replanner_params.rbl_radius         = params.radius;
+    replanner_params.rbl_lookahead      = params.path_lookahead_distance;
+    replanner_params.ciri_inflation     = params.encumbrance + params.voxel_size;
+    replanner_params.heading_weight     = 0.0;
+    replanner_params.outside_rbl_weight = 5.0;
+    replanner_params.min_clearance      = params.voxel_size;
+    // A*/RBL altitude consensus: stay below RBL z_max with margin, so A* never asks for 4 m flight.
+    replanner_params.max_flight_z       = std::min(3.6, params.z_max - 0.4);
 
     rbl_replanner_ = std::make_shared<RBLReplanner>(replanner_params);
   }
@@ -192,10 +208,11 @@ void RBLController::setGoal(const Eigen::Vector3d& point)  // //{
   c1_                      = point;
   c1_full_                 = point;
   seed_b_                  = agent_pos_;
-  path_.clear();
+  clearReplannerPath();
   inflated_map_.clear();
   ph_                      = 0.0;
   th_                      = 0.0;
+  resetRecoveryForNewGoal();
 }  // //}
 
 void RBLController::setBetaD(double beta)
@@ -316,6 +333,9 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
     return pRefAgent(agent_pos_, rpy_[2]);
   }
 
+  updateRecoveryState();
+  const Eigen::Vector3d planning_goal = activePlanningGoal();
+
   const auto replanner_start = std::chrono::steady_clock::now();
   if (params_.replanner) {
     const bool replanner_idle =
@@ -325,18 +345,26 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
     // Launch replanner only if not already running
     if ((pending_replan_ || rbl_replanner_->replanTimer()) && replanner_idle) {
 
-      const auto goal_snapshot       = goal_;
+      const auto goal_snapshot       = planning_goal;
       const auto altitude_snapshot   = altitude_;
       const auto agent_pos_snapshot  = agent_pos_;
       const auto cloud_snapshot      = cloud_;
+      const auto virtual_obstacles_snapshot = activeVirtualObstacles(std::chrono::steady_clock::now());
       const auto goal_generation     = goal_generation_;
       pending_replan_                = false;
 
-      replanner_future_ = std::async(std::launch::async, [this, goal_snapshot, altitude_snapshot, agent_pos_snapshot, cloud_snapshot, goal_generation]() {
+      replanner_future_ = std::async(std::launch::async, [this,
+                                                           goal_snapshot,
+                                                           altitude_snapshot,
+                                                           agent_pos_snapshot,
+                                                           cloud_snapshot,
+                                                           virtual_obstacles_snapshot,
+                                                           goal_generation]() {
         rbl_replanner_->setAltitude(altitude_snapshot);
         rbl_replanner_->setCurrentPosition(agent_pos_snapshot);
         rbl_replanner_->setGoal(goal_snapshot);
         rbl_replanner_->setPCL(cloud_snapshot);
+        rbl_replanner_->setVirtualObstacles(virtual_obstacles_snapshot);
 
         auto new_path = rbl_replanner_->plan();
 
@@ -352,8 +380,13 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
       auto [planned_generation, new_path, new_inflated_map] = replanner_future_.get();
       if (planned_generation == goal_generation_) {
         if (!new_path.empty()) {
-          path_         = std::move(new_path);
-          inflated_map_ = std::move(new_inflated_map);
+          if (shouldAcceptReplannerPath(new_path, planning_goal)) {
+            acceptReplannerPath(std::move(new_path), std::move(new_inflated_map), planning_goal);
+          }
+          else if (shouldLogRbl("replanner_rejected_flip", 0.5)) {
+            std::cout << "[RBLController][replanner] rejected opposite periodic path update, keeping current path size="
+                      << path_.size() << std::endl;
+          }
         } else {
           std::cout << "[RBLController][replanner] received empty path, keeping previous path size=" << path_.size()
                     << std::endl;
@@ -363,12 +396,20 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
 
     // Use path if available; after a new goal, wait here until the first replanner path is ready.
     if (!path_.empty()) {
-      waypoint_fixed_distance_ = determineWaypointFixedDistance(path_, agent_pos_, goal_);
+      waypoint_fixed_distance_ = determineWaypointFixedDistance(path_, agent_pos_, planning_goal);
       waypoint_                = waypoint_fixed_distance_;
       destination_             = waypoint_;
     } else {
       if (shouldLogRbl("waiting_for_replanner_path", 1.0)) {
         std::cout << "[RBLController][replanner] waiting for first non-empty path before moving to goal" << std::endl;
+      }
+      if (recovery_mode_ == RecoveryMode::ESCAPE_BACKTRACK) {
+        return recoveryFallbackRef();
+      }
+      if (recovery_mode_ == RecoveryMode::RECOVERY_COOLDOWN) {
+        const Eigen::Vector3d to_goal = goal_ - agent_pos_;
+        const double heading = to_goal.head<2>().norm() > 1e-6 ? std::atan2(to_goal.y(), to_goal.x()) : rpy_.z();
+        return pRefAgent(agent_pos_, heading);
       }
       return pRefAgent(agent_pos_, rpy_[2]);
     }
@@ -441,6 +482,7 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
               << ", beta=" << beta_
               << ", agent=" << vecToString(agent_pos_)
               << ", goal=" << vecToString(goal_)
+              << ", planning_goal=" << vecToString(planning_goal)
               << ", destination=" << vecToString(destination_)
               << ", waypoint=" << vecToString(waypoint_) << std::endl;
   }
@@ -567,7 +609,7 @@ std::optional<mrs_msgs::msg::Reference> RBLController::getNextRef()  // //{
   // }
   // if c1_ is very close to uav.
   const auto ref_start = std::chrono::steady_clock::now();
-  determineNextRef(p_ref, agent_pos_, waypoint_, goal_, c1_, c1_full_, rpy_, path_);
+  determineNextRef(p_ref, agent_pos_, waypoint_, planning_goal, c1_, c1_full_, rpy_, path_);
   const auto ref_stop = std::chrono::steady_clock::now();
 
   if (shouldLogRbl("reference_out", 0.5)) {
@@ -1963,6 +2005,92 @@ void RBLController::applyRules(double&                beta,  // //{
   }
 }  // //}
 
+bool RBLController::isWaypointSegmentClear(const Eigen::Vector3d& from,
+                                           const Eigen::Vector3d& to) const  // //{
+{
+  if (inflated_map_.empty()) {
+    return true;
+  }
+
+  const Eigen::Vector3d segment = to - from;
+  const double segment_len_sq = segment.squaredNorm();
+  if (segment_len_sq <= 1e-12) {
+    return true;
+  }
+
+  const double obstacle_radius = std::max(0.35, params_.voxel_size);
+  const double obstacle_radius_sq = obstacle_radius * obstacle_radius;
+
+  for (const auto& obstacle : inflated_map_) {
+    const double t = std::clamp((obstacle - from).dot(segment) / segment_len_sq, 0.0, 1.0);
+    const Eigen::Vector3d closest = from + t * segment;
+    if ((obstacle - closest).squaredNorm() <= obstacle_radius_sq) {
+      return false;
+    }
+  }
+
+  return true;
+}  // //}
+
+bool RBLController::shouldAcceptReplannerPath(const std::vector<Eigen::Vector3d>& new_path,
+                                              const Eigen::Vector3d&              planning_goal) const  // //{
+{
+  if (new_path.empty()) {
+    return false;
+  }
+
+  if (path_.empty() || !accepted_path_goal_.isApprox(planning_goal, 0.3) ||
+      accepted_path_recovery_mode_ != recovery_mode_) {
+    return true;
+  }
+
+  if (!isWaypointSegmentClear(agent_pos_, waypoint_)) {
+    return true;
+  }
+
+  auto firstUsefulDirection = [this](const std::vector<Eigen::Vector3d>& candidate_path) -> Eigen::Vector3d {
+    for (const auto& point : candidate_path) {
+      const Eigen::Vector3d direction = point - agent_pos_;
+      if (direction.norm() > 0.7) {
+        return Eigen::Vector3d(direction.normalized());
+      }
+    }
+    return Eigen::Vector3d::Zero();
+  };
+
+  const Eigen::Vector3d current_direction = waypoint_ - agent_pos_;
+  const Eigen::Vector3d candidate_direction = firstUsefulDirection(new_path);
+  if (current_direction.norm() > 0.7 && candidate_direction.norm() > 0.7) {
+    const double direction_dot = current_direction.normalized().dot(candidate_direction.normalized());
+    // Recovery/stuck detection: reject periodic replans that point almost opposite to
+    // the path currently being executed. Forced mode/goal changes and blocked current paths
+    // are accepted above, so this mainly removes U-turn branch flip-flops.
+    if (direction_dot < -0.2) {
+      return false;
+    }
+  }
+
+  return true;
+}  // //}
+
+void RBLController::acceptReplannerPath(std::vector<Eigen::Vector3d>&& new_path,
+                                        std::vector<Eigen::Vector3d>&& new_inflated_map,
+                                        const Eigen::Vector3d&         planning_goal)  // //{
+{
+  path_ = std::move(new_path);
+  inflated_map_ = std::move(new_inflated_map);
+  path_progress_index_ = 0;
+  path_last_accept_time_ = std::chrono::steady_clock::now();
+  accepted_path_goal_ = planning_goal;
+  accepted_path_recovery_mode_ = recovery_mode_;
+}  // //}
+
+void RBLController::clearReplannerPath()  // //{
+{
+  path_.clear();
+  path_progress_index_ = 0;
+}  // //}
+
 Eigen::Vector3d RBLController::determineWaypointFixedDistance(const std::vector<Eigen::Vector3d>& path,  // //{
                                                               const Eigen::Vector3d&              agent_pos,
                                                               const Eigen::Vector3d&              goal)
@@ -1972,9 +2100,8 @@ Eigen::Vector3d RBLController::determineWaypointFixedDistance(const std::vector<
   }
 
   const double dist_agent_goal = (goal - agent_pos).norm();
-  const double lookahead       = params_.path_lookahead_distance > 0.0 ? params_.path_lookahead_distance : params_.radius;
-  const double r               = std::min(lookahead, dist_agent_goal);
-  if (r <= 1e-6) {
+  const double max_lookahead   = params_.path_lookahead_distance > 0.0 ? params_.path_lookahead_distance : params_.radius;
+  if (std::min(max_lookahead, dist_agent_goal) <= 1e-6) {
     return goal;
   }
 
@@ -1982,8 +2109,11 @@ Eigen::Vector3d RBLController::determineWaypointFixedDistance(const std::vector<
   size_t    closest_point_index = 0;
   bool found = false;
 
-  // Find closest path point
-  for (size_t i = 0; i < path.size(); ++i) {
+  // Recovery/stuck detection: follow path progress monotonically. Searching from the last
+  // accepted index prevents U-turn branches from stealing the closest point behind the UAV.
+  const size_t search_begin = std::min(path_progress_index_, path.size() - 1);
+  const size_t search_end = std::min(path.size(), search_begin + 35);
+  for (size_t i = search_begin; i < search_end; ++i) {
     double dist_sq = (path[i] - agent_pos).squaredNorm();
     if (dist_sq < min_dist_sq) {
       min_dist_sq         = dist_sq;
@@ -1996,41 +2126,73 @@ Eigen::Vector3d RBLController::determineWaypointFixedDistance(const std::vector<
   if (!found || closest_point_index + 1 >= path.size()) {
     return path.back();
   }
+  path_progress_index_ = std::max(path_progress_index_, closest_point_index);
 
-  // Iterate over path segments starting from the closest
-  for (size_t i = closest_point_index; i < path.size() - 1; ++i) {
-    Eigen::Vector3d p1 = path[i];
-    Eigen::Vector3d p2 = path[i + 1];
-    Eigen::Vector3d d  = p2 - p1;  // segment direction
+  const auto waypointAtLookahead = [&](const double lookahead) -> Eigen::Vector3d {
+    const double r = std::min(lookahead, dist_agent_goal);
 
-    // Quadratic equation for intersection of segment with circle
-    Eigen::Vector3d f = p1 - agent_pos;
-    double          a = d.dot(d);
-    if (a <= 1e-12) {
-      continue;
+    // Iterate over path segments starting from the closest
+    for (size_t i = closest_point_index; i < path.size() - 1; ++i) {
+      Eigen::Vector3d p1 = path[i];
+      Eigen::Vector3d p2 = path[i + 1];
+      Eigen::Vector3d d  = p2 - p1;  // segment direction
+
+      // Quadratic equation for intersection of segment with circle
+      Eigen::Vector3d f = p1 - agent_pos;
+      double          a = d.dot(d);
+      if (a <= 1e-12) {
+        continue;
+      }
+      double          b = 2 * f.dot(d);
+      double          c = f.dot(f) - r * r;
+
+      double discriminant = b * b - 4 * a * c;
+      if (discriminant < 0) {
+        continue;  // no intersection
+      }
+
+      discriminant = std::sqrt(discriminant);
+      double t1    = (-b - discriminant) / (2 * a);
+      double t2    = (-b + discriminant) / (2 * a);
+
+      // Check if intersections are within the segment
+      if (t1 >= 0.0 && t1 <= 1.0) {
+        return Eigen::Vector3d(p1 + t1 * d);
+      }
+      if (t2 >= 0.0 && t2 <= 1.0) {
+        return Eigen::Vector3d(p1 + t2 * d);
+      }
     }
-    double          b = 2 * f.dot(d);
-    double          c = f.dot(f) - r * r;
 
-    double discriminant = b * b - 4 * a * c;
-    if (discriminant < 0) {
-      continue;  // no intersection
-    }
+    return path.back();
+  };
 
-    discriminant = std::sqrt(discriminant);
-    double t1    = (-b - discriminant) / (2 * a);
-    double t2    = (-b + discriminant) / (2 * a);
+  const double min_lookahead = std::min(max_lookahead, std::max(0.9, 3.0 * params_.voxel_size));
+  double lookahead = max_lookahead;
+  Eigen::Vector3d fallback_waypoint = waypointAtLookahead(min_lookahead);
 
-    // Check if intersections are within the segment
-    if (t1 >= 0.0 && t1 <= 1.0) {
-      return p1 + t1 * d;
+  // Adaptive lookahead: keep the normal long lookahead on open/straight sections,
+  // but shrink it if the direct segment to the waypoint crosses the replanner's inflated map.
+  // This prevents U-turn shortcuts through obstacles while still allowing the A* path to contain U-turns.
+  while (lookahead >= min_lookahead - 1e-6) {
+    const Eigen::Vector3d candidate = waypointAtLookahead(lookahead);
+    fallback_waypoint = candidate;
+    if (isWaypointSegmentClear(agent_pos, candidate)) {
+      if (lookahead + 1e-6 < max_lookahead && shouldLogRbl("adaptive_lookahead", 0.5)) {
+        std::cout << "[RBLController][lookahead] reduced lookahead from " << max_lookahead
+                  << " to " << lookahead
+                  << ", waypoint=" << vecToString(candidate) << std::endl;
+      }
+      return candidate;
     }
-    if (t2 >= 0.0 && t2 <= 1.0) {
-      return p1 + t2 * d;
-    }
+    lookahead *= 0.7;
   }
 
-  return path.back();
+  if (shouldLogRbl("adaptive_lookahead_blocked", 0.5)) {
+    std::cout << "[RBLController][lookahead] using minimum lookahead candidate despite blocked direct segment. waypoint="
+              << vecToString(fallback_waypoint) << std::endl;
+  }
+  return fallback_waypoint;
 }  // //}
 
 Eigen::Vector3d RBLController::determineWaypoint(const std::vector<Eigen::Vector3d>& path,  // //{
@@ -2099,6 +2261,328 @@ void RBLController::determineNextRef(mrs_msgs::msg::Reference&                p_
     p_ref.position.y = c1[1];
     p_ref.position.z = c1[2];
   }
+}  // //}
+
+mrs_msgs::msg::Reference RBLController::recoveryFallbackRef() const  // //{
+{
+  mrs_msgs::msg::Reference p_ref;
+  const Eigen::Vector3d to_escape = active_recovery_goal_ - agent_pos_;
+  const double distance = to_escape.norm();
+  const double step = std::min(1.2, distance);
+  Eigen::Vector3d reference = agent_pos_;
+  if (distance > 1e-6) {
+    reference = Eigen::Vector3d(agent_pos_ + step * to_escape.normalized());
+  }
+
+  // Recovery/stuck detection: if A* is temporarily empty while escaping, keep moving toward
+  // the selected breadcrumb instead of commanding a hard hold at the current position.
+  p_ref.position.x = reference.x();
+  p_ref.position.y = reference.y();
+  p_ref.position.z = reference.z();
+  p_ref.heading = distance > 1e-6 ? std::atan2(to_escape.y(), to_escape.x()) : rpy_.z();
+  return p_ref;
+}  // //}
+
+void RBLController::updateRecoveryState()  // //{
+{
+  const auto now = std::chrono::steady_clock::now();
+  pruneVirtualObstacles(now);
+  appendRecoveryBreadcrumb(now);
+
+  if (!params_.replanner || !has_goal_) {
+    return;
+  }
+
+  const double dist_to_goal = (goal_ - agent_pos_).norm();
+  if (dist_to_goal < 0.8) {
+    recovery_mode_ = RecoveryMode::NORMAL;
+    return;
+  }
+
+  if (recovery_mode_ == RecoveryMode::ESCAPE_BACKTRACK) {
+    const double dist_to_escape = (active_recovery_goal_ - agent_pos_).norm();
+    const double escape_time_s = std::chrono::duration<double>(now - recovery_escape_started_time_).count();
+    if (dist_to_escape < 0.7 || escape_time_s > 10.0) {
+      // Recovery/stuck detection: after reaching the breadcrumb, resume the real goal after a short cooldown.
+      recovery_mode_ = RecoveryMode::RECOVERY_COOLDOWN;
+      recovery_cooldown_until_ = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(3.0));
+      recovery_has_progress_sample_ = false;
+      pending_replan_ = true;
+      clearReplannerPath();
+      std::cout << "[RBLController][recovery] escape finished, resuming global goal after cooldown. dist_to_escape="
+                << dist_to_escape << ", escape_time_s=" << escape_time_s << std::endl;
+    }
+    return;
+  }
+
+  if (recovery_mode_ == RecoveryMode::RECOVERY_COOLDOWN) {
+    if (now < recovery_cooldown_until_) {
+      return;
+    }
+    recovery_mode_ = RecoveryMode::NORMAL;
+    recovery_has_progress_sample_ = false;
+  }
+
+  const double grace_s = std::chrono::duration<double>(now - recovery_goal_set_time_).count();
+  if (grace_s < 4.0 || path_.empty() || pending_replan_) {
+    return;
+  }
+
+  if (!recovery_has_progress_sample_) {
+    recovery_last_progress_pos_ = agent_pos_;
+    recovery_best_goal_dist_ = dist_to_goal;
+    recovery_last_progress_time_ = now;
+    recovery_has_progress_sample_ = true;
+    return;
+  }
+
+  const bool moved_enough = (agent_pos_ - recovery_last_progress_pos_).norm() > 0.5;
+  const bool improved_goal_dist = dist_to_goal + 0.35 < recovery_best_goal_dist_;
+  if (moved_enough || improved_goal_dist) {
+    recovery_last_progress_pos_ = agent_pos_;
+    recovery_best_goal_dist_ = std::min(recovery_best_goal_dist_, dist_to_goal);
+    recovery_last_progress_time_ = now;
+    return;
+  }
+
+  const double no_progress_s = std::chrono::duration<double>(now - recovery_last_progress_time_).count();
+  const bool low_speed = agent_vel_.norm() < 0.35;
+  if (no_progress_s < 6.0 || !low_speed) {
+    return;
+  }
+
+  enterRecoveryEscape(now);
+}  // //}
+
+void RBLController::resetRecoveryForNewGoal()  // //{
+{
+  const auto now = std::chrono::steady_clock::now();
+  // Recovery/stuck detection: a user-level goal change starts a fresh recovery episode.
+  // Old virtual obstacles are discarded because they describe a previous navigation intent.
+  recovery_mode_ = RecoveryMode::NORMAL;
+  breadcrumbs_.clear();
+  virtual_obstacles_.clear();
+  active_recovery_goal_ = Eigen::Vector3d::Zero();
+  recovery_last_progress_pos_ = agent_pos_;
+  recovery_last_stuck_pos_ = Eigen::Vector3d::Zero();
+  recovery_best_goal_dist_ = std::numeric_limits<double>::infinity();
+  recovery_repeat_stuck_count_ = 0;
+  recovery_has_progress_sample_ = false;
+  recovery_has_stuck_sample_ = false;
+  recovery_goal_set_time_ = now;
+  recovery_last_progress_time_ = now;
+  recovery_escape_started_time_ = now;
+  recovery_cooldown_until_ = now;
+  path_last_accept_time_ = now;
+  accepted_path_recovery_mode_ = RecoveryMode::NORMAL;
+  accepted_path_goal_ = Eigen::Vector3d::Zero();
+}  // //}
+
+void RBLController::appendRecoveryBreadcrumb(const std::chrono::steady_clock::time_point& now)  // //{
+{
+  if (!has_goal_ || !isFiniteVector(agent_pos_)) {
+    return;
+  }
+
+  constexpr std::size_t max_breadcrumbs = 120;
+  constexpr double min_spacing = 0.5;
+  if (!breadcrumbs_.empty() && (breadcrumbs_.back().position - agent_pos_).norm() < min_spacing) {
+    return;
+  }
+
+  Breadcrumb breadcrumb;
+  breadcrumb.position = agent_pos_;
+  breadcrumb.stamp = now;
+  breadcrumb.goal_generation = goal_generation_;
+  breadcrumbs_.push_back(breadcrumb);
+  while (breadcrumbs_.size() > max_breadcrumbs) {
+    breadcrumbs_.pop_front();
+  }
+}  // //}
+
+bool RBLController::selectEscapeBreadcrumb(Eigen::Vector3d& escape_goal) const  // //{
+{
+  bool found = false;
+  double best_score = -std::numeric_limits<double>::infinity();
+
+  for (auto it = breadcrumbs_.rbegin(); it != breadcrumbs_.rend(); ++it) {
+    if (it->goal_generation != goal_generation_) {
+      continue;
+    }
+
+    const double distance = (it->position - agent_pos_).norm();
+    if (distance < 2.0) {
+      continue;
+    }
+
+    // Recovery/stuck detection: prefer a breadcrumb far enough to leave the local minimum,
+    // but avoid jumping too far back unless this is a repeated stuck region.
+    const double desired_distance = recovery_repeat_stuck_count_ >= 3 ? 6.0 : 4.0;
+    const double score = -std::abs(distance - desired_distance);
+    if (!found || score > best_score) {
+      escape_goal = it->position;
+      best_score = score;
+      found = true;
+    }
+  }
+
+  return found;
+}  // //}
+
+void RBLController::enterRecoveryEscape(const std::chrono::steady_clock::time_point& now)  // //{
+{
+  if (recovery_has_stuck_sample_ && (agent_pos_ - recovery_last_stuck_pos_).norm() < 1.5) {
+    ++recovery_repeat_stuck_count_;
+  }
+  else {
+    recovery_repeat_stuck_count_ = 1;
+  }
+  recovery_has_stuck_sample_ = true;
+  recovery_last_stuck_pos_ = agent_pos_;
+
+  Eigen::Vector3d escape_goal;
+  if (!selectEscapeBreadcrumb(escape_goal)) {
+    if (shouldLogRbl("recovery_no_breadcrumb", 1.0)) {
+      std::cout << "[RBLController][recovery] stuck detected, but no safe breadcrumb is far enough yet" << std::endl;
+    }
+    recovery_last_progress_time_ = now;
+    return;
+  }
+
+  if (recovery_repeat_stuck_count_ >= 2) {
+    addOrStrengthenVirtualObstacle(agent_pos_, now);
+    addFailedPathVirtualObstacles(agent_pos_, escape_goal, now);
+  }
+
+  // Recovery/stuck detection: first stuck escapes backward; repeated stuck also biases A*
+  // away from this region through virtual obstacles with TTL.
+  active_recovery_goal_ = escape_goal;
+  recovery_mode_ = RecoveryMode::ESCAPE_BACKTRACK;
+  recovery_escape_started_time_ = now;
+  pending_replan_ = true;
+  clearReplannerPath();
+
+  std::cout << "[RBLController][recovery] stuck detected. repeat=" << recovery_repeat_stuck_count_
+            << ", escape_goal=" << vecToString(active_recovery_goal_)
+            << ", stuck_pos=" << vecToString(agent_pos_)
+            << ", virtual_obstacles=" << virtual_obstacles_.size() << std::endl;
+}  // //}
+
+void RBLController::addOrStrengthenVirtualObstacle(const Eigen::Vector3d& stuck_position,
+                                                   const std::chrono::steady_clock::time_point& now)  // //{
+{
+  addVirtualObstacleMemory(stuck_position, 1.4, 45.0, now);
+}  // //}
+
+void RBLController::addVirtualObstacleMemory(const Eigen::Vector3d& center,
+                                             double                  radius,
+                                             double                  weight,
+                                             const std::chrono::steady_clock::time_point& now)  // //{
+{
+  constexpr double ttl_s = 25.0;
+  const auto expires_at = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(ttl_s));
+
+  for (auto& obstacle : virtual_obstacles_) {
+    if ((obstacle.center - center).norm() > 1.2) {
+      continue;
+    }
+
+    obstacle.center = 0.7 * obstacle.center + 0.3 * center;
+    obstacle.repeat_count += 1;
+    obstacle.radius = std::min(3.0, std::max(obstacle.radius, radius) + 0.25);
+    obstacle.weight = std::min(180.0, std::max(obstacle.weight, weight) * 1.35);
+    obstacle.expires_at = expires_at;
+    return;
+  }
+
+  VirtualObstacleMemory obstacle;
+  obstacle.center = center;
+  obstacle.radius = radius;
+  obstacle.weight = weight;
+  obstacle.repeat_count = 1;
+  obstacle.expires_at = expires_at;
+  virtual_obstacles_.push_back(obstacle);
+}  // //}
+
+void RBLController::addFailedPathVirtualObstacles(const Eigen::Vector3d& stuck_position,
+                                                  const Eigen::Vector3d& escape_goal,
+                                                  const std::chrono::steady_clock::time_point& now)  // //{
+{
+  double last_added_distance = -std::numeric_limits<double>::infinity();
+  int added = 0;
+  const double max_failed_distance = recovery_repeat_stuck_count_ >= 3 ? 8.0 : 5.0;
+
+  for (auto it = breadcrumbs_.rbegin(); it != breadcrumbs_.rend(); ++it) {
+    if (it->goal_generation != goal_generation_) {
+      continue;
+    }
+
+    const double dist_from_stuck = (it->position - stuck_position).norm();
+    if (dist_from_stuck < 0.8) {
+      continue;
+    }
+    if (dist_from_stuck > max_failed_distance) {
+      break;
+    }
+
+    // Recovery/stuck detection: leave the escape endpoint mostly unpenalized, otherwise
+    // the fallback/backtracking route can become expensive before the UAV has left the trap.
+    if ((it->position - escape_goal).norm() < 1.5) {
+      continue;
+    }
+
+    if (std::abs(dist_from_stuck - last_added_distance) < 0.9) {
+      continue;
+    }
+
+    addVirtualObstacleMemory(it->position, 1.2, recovery_repeat_stuck_count_ >= 3 ? 70.0 : 50.0, now);
+    last_added_distance = dist_from_stuck;
+    ++added;
+    if (added >= 6) {
+      break;
+    }
+  }
+
+  if (added > 0 && shouldLogRbl("recovery_failed_path_memory", 0.5)) {
+    std::cout << "[RBLController][recovery] added failed-path virtual obstacle chain, count=" << added
+              << ", repeat=" << recovery_repeat_stuck_count_
+              << ", total_virtual_obstacles=" << virtual_obstacles_.size() << std::endl;
+  }
+}  // //}
+
+void RBLController::pruneVirtualObstacles(const std::chrono::steady_clock::time_point& now)  // //{
+{
+  virtual_obstacles_.erase(std::remove_if(virtual_obstacles_.begin(),
+                                          virtual_obstacles_.end(),
+                                          [&now](const VirtualObstacleMemory& obstacle) {
+                                            return now >= obstacle.expires_at;
+                                          }),
+                           virtual_obstacles_.end());
+}  // //}
+
+std::vector<ReplannerVirtualObstacle> RBLController::activeVirtualObstacles(
+    const std::chrono::steady_clock::time_point& now) const  // //{
+{
+  std::vector<ReplannerVirtualObstacle> obstacles;
+  for (const auto& obstacle : virtual_obstacles_) {
+    if (now >= obstacle.expires_at) {
+      continue;
+    }
+    ReplannerVirtualObstacle replanner_obstacle;
+    replanner_obstacle.center = obstacle.center;
+    replanner_obstacle.radius = obstacle.radius;
+    replanner_obstacle.weight = obstacle.weight;
+    obstacles.push_back(replanner_obstacle);
+  }
+  return obstacles;
+}  // //}
+
+Eigen::Vector3d RBLController::activePlanningGoal() const  // //{
+{
+  if (recovery_mode_ == RecoveryMode::ESCAPE_BACKTRACK) {
+    return active_recovery_goal_;
+  }
+  return goal_;
 }  // //}
 
 mrs_msgs::msg::Reference RBLController::pRefAgent(const Eigen::Vector3d& agent_pos,
